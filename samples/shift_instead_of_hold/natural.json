@@ -1,0 +1,16 @@
+{
+  "session_id": "naturalistic_V02_S3294_I00000374_P4151_P4152__shift_instead_of_hold__k1__natural",
+  "duration": 20.65,
+  "language": "en",
+  "session_type": "dyadic",
+  "augmentation_type": "natural_reference",
+  "source_natural_stem": "naturalistic_V02_S3294_I00000374_P4151_P4152",
+  "turn_source": "silero",
+  "vad_config": {
+    "threshold": 0.5,
+    "min_speech_ms": 120.0,
+    "min_silence_ms": 120.0,
+    "speech_pad_ms": 40.0,
+    "merge_gap_ms": 180.0
+  }
+}

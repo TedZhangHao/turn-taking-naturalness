@@ -1,0 +1,28 @@
+base_config: configs/base.yaml
+arguments:
+  backbone: dualturn
+  train_mode: full
+  dualturn_fvad_head: native8
+  head_init: pretrained
+  fvad_target_scheme: native-soft
+  dualturn_losses: all
+  signal_label_cache_dir: data/cache/signals
+  vad_cache_dir: data/cache/vad
+  output_dir: outputs/dualturn_native_all6
+  train_manifest: data/manifests/train.csv
+  val_manifest: data/manifests/dev.csv
+  test1_manifest: data/manifests/test1.csv
+  epochs: 5
+  lr: 5.0e-6
+  backbone_lr: 1.0e-6
+  train_batch_size: 2
+  eval_batch_size: 2
+  eval_every_steps: 1500
+  max_mid_eval_batches: 200
+  weight_fvad: 1.0
+  weight_vad: 1.0
+  weight_eot: 1.0
+  weight_hold: 1.0
+  weight_bot: 1.0
+  weight_bc: 1.0
+  naturalness_bernoulli_reduction: sum

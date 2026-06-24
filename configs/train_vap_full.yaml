@@ -1,0 +1,19 @@
+base_config: configs/base.yaml
+arguments:
+  backbone: vap
+  train_mode: full
+  vap_ckpt: checkpoints/VAP_state_dict.pt
+  head_init: pretrained
+  fvad_target_scheme: shared-binary
+  output_dir: outputs/vap_full
+  train_manifest: data/manifests/train.csv
+  val_manifest: data/manifests/dev.csv
+  test1_manifest: data/manifests/test1.csv
+  epochs: 5
+  lr: 1.0e-6
+  backbone_lr: 1.0e-7
+  vap_vad_loss_weight: 1.0
+  train_batch_size: 16
+  eval_batch_size: 16
+  eval_every_steps: 1500
+  max_mid_eval_batches: 200

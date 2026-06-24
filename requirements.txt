@@ -1,0 +1,16 @@
+torch>=2.1
+torchaudio>=2.1
+transformers>=4.37
+peft>=0.7
+safetensors
+huggingface-hub
+moshi
+silero-vad
+numpy
+scipy
+pandas
+soundfile
+pyyaml
+tqdm
+einops
+wandb

@@ -1,0 +1,27 @@
+seed: 42
+
+paths:
+  output_dir: outputs/default
+
+precision:
+  mode: bf16
+  matmul_precision: high
+
+data:
+  train_manifest: data/manifests/train.csv
+  val_manifest: data/manifests/dev.csv
+  test1_manifest: data/manifests/test1.csv
+  target_sample_rate: 24000
+  samples_per_frame: 1920
+  frame_hz: 12.5
+  chunk_seconds: 12.0
+  eval_chunk_seconds: 12.0
+  train_batch_size: 4
+  eval_batch_size: 4
+  num_workers: 4
+  pin_memory: true
+  vad:
+    rms_threshold: 0.015
+
+model:
+  head_dropout: 0.1

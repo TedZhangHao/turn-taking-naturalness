@@ -1,0 +1,16 @@
+{
+  "session_id": "naturalistic_V00_S65_I00000125_P0097_P0098__late_response__k1__natural",
+  "duration": 23.374395833333335,
+  "language": "en",
+  "session_type": "dyadic",
+  "augmentation_type": "natural_reference",
+  "source_natural_stem": "naturalistic_V00_S65_I00000125_P0097_P0098",
+  "turn_source": "silero",
+  "vad_config": {
+    "threshold": 0.5,
+    "min_speech_ms": 120.0,
+    "min_silence_ms": 120.0,
+    "speech_pad_ms": 40.0,
+    "merge_gap_ms": 180.0
+  }
+}
