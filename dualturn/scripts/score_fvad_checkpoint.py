@@ -18,12 +18,12 @@ for path in (PROJECT_ROOT, VAP_ROOT):
 
 from train_fvad_head import (  # noqa: E402
     DEFAULT_DUALTURN_MODEL_ID,
-    NaturalnessFiveTypeEvaluator,
     OfficialDualTurnFVADModel,
     VAP256Model,
     load_training_checkpoint,
     vap_bin_times_to_frames,
 )
+from fvad_naturalness_eval import NaturalnessFiveTypeEvaluator  # noqa: E402
 
 
 DEFAULT_EXPERIMENT = "group4-dualturn-full-all6-fvad256"
@@ -215,8 +215,6 @@ def main() -> None:
         "checkpoint_epoch": payload.get("epoch"),
         "checkpoint_global_step": payload.get("global_step"),
         "checkpoint_args_present": bool(payload.get("args")),
-        "checkpoint_selection_metric": payload.get("naturalness_metric"),
-        "checkpoint_selection_value": payload.get("naturalness_metric_value"),
         "model": asdict(spec),
         "manifest": str(args.manifest.resolve()),
         "frame_nll": (

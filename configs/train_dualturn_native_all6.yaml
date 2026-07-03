@@ -25,4 +25,3 @@ arguments:
   weight_hold: 1.0
   weight_bot: 1.0
   weight_bc: 1.0
-  naturalness_bernoulli_reduction: sum

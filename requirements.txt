@@ -1,16 +1,12 @@
+# Core dependencies for data-only perturbation generation.
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+soundfile>=0.12
+tqdm>=4.65
+PyYAML>=6.0
+
+# Silero VAD is used by the default generation settings.
 torch>=2.1
 torchaudio>=2.1
-transformers>=4.37
-peft>=0.7
-safetensors
-huggingface-hub
-moshi
-silero-vad
-numpy
-scipy
-pandas
-soundfile
-pyyaml
-tqdm
-einops
-wandb
+silero-vad>=5.1

@@ -1,0 +1,10 @@
+# Optional dependencies for model training and checkpoint evaluation.
+-r requirements.txt
+
+transformers>=4.37
+peft>=0.7
+safetensors>=0.4
+huggingface-hub>=0.20
+moshi>=0.2
+einops>=0.7
+wandb>=0.16

@@ -546,7 +546,7 @@ def get_candidate_context(
     *,
     p1_path: str | Path | None = None,
     p2_path: str | Path | None = None,
-    turn_source: str = "metadata",
+    turn_source: str = "silero",
     min_transcript_ms: float = 250.0,
 ) -> tuple[list[Segment], list[Segment], np.ndarray, np.ndarray, dict[str, str]]:
     frame_len = int(round(sr * frame_ms / 1000.0))
@@ -3420,7 +3420,7 @@ def add_context_turn_metadata(
 
 def make_missed_backchannel(a: np.ndarray, b: np.ndarray, sr: int, rng: random.Random, frame_ms: float, threshold: float,
                               p1_path: str | Path | None = None, p2_path: str | Path | None = None,
-                              turn_source: str = "metadata", bc_remove_count: int = 1,
+                              turn_source: str = "silero", bc_remove_count: int = 1,
                               min_missed_backchannels: int = 1) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     frame_len = int(round(sr * frame_ms / 1000.0))
     sa, sb, va, vb, turn_sources = get_candidate_context(
@@ -3490,11 +3490,11 @@ def make_missed_backchannel(a: np.ndarray, b: np.ndarray, sr: int, rng: random.R
 
 
 def make_excessive_backchannel(a: np.ndarray, b: np.ndarray, sr: int, rng: random.Random, frame_ms: float, threshold: float,
-                               bc_insert_gain: float = 0.85, p1_path: str | Path | None = None,
-                               p2_path: str | Path | None = None, turn_source: str = "metadata",
-                               bc_insert_count: int = 1, bc_insert_min_gap_ms: float = 800.0,
-                               allow_bc_source_reuse: bool = True,
-                               max_bc_source_reuse_per_clip: int = 1,
+                               bc_insert_gain: float = 1.0, p1_path: str | Path | None = None,
+                               p2_path: str | Path | None = None, turn_source: str = "silero",
+                               bc_insert_count: int = 2, bc_insert_min_gap_ms: float = 800.0,
+                               allow_bc_source_reuse: bool = False,
+                               max_bc_source_reuse_per_clip: int = 0,
                                allow_empty_bc_text: bool = False) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     frame_len = int(round(sr * frame_ms / 1000.0))
     sa, sb, va, vb, turn_sources = get_candidate_context(
@@ -3695,7 +3695,7 @@ def make_excessive_backchannel(a: np.ndarray, b: np.ndarray, sr: int, rng: rando
 
 def make_hold_instead_of_shift(a: np.ndarray, b: np.ndarray, sr: int, rng: random.Random, frame_ms: float, threshold: float,
                                hold_extension_ms: int = 800, p1_path: str | Path | None = None,
-                               p2_path: str | Path | None = None, turn_source: str = "metadata",
+                               p2_path: str | Path | None = None, turn_source: str = "silero",
                                hold_shift_remove_pad_ms: float = 500.0,
                                hold_shift_max_gap_ms: float | None = None,
                                hold_shift_min_edited_hold_gap_ms: float = 100.0,
@@ -3840,10 +3840,10 @@ def make_hold_instead_of_shift(a: np.ndarray, b: np.ndarray, sr: int, rng: rando
 
 def make_shift_instead_of_hold(a: np.ndarray, b: np.ndarray, sr: int, rng: random.Random, frame_ms: float, threshold: float,
                                shift_insert_gain: float = 0.9, p1_path: str | Path | None = None,
-                               p2_path: str | Path | None = None, turn_source: str = "metadata",
+                               p2_path: str | Path | None = None, turn_source: str = "silero",
                                shift_hold_pre_silence_ms: float = 1000.0,
                                shift_hold_post_silence_ms: float = 1000.0,
-                               shift_hold_min_gap_ms: float = 200.0,
+                               shift_hold_min_gap_ms: float = 300.0,
                                shift_hold_max_gap_ms: float = 1000.0,
                                shift_hold_min_insert_s: float = 1.0,
                                shift_hold_max_insert_s: float = 4.0) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
@@ -4050,7 +4050,7 @@ def sample_natural(
     idxs = rng.sample(list(range(len(nat))), n_pairs)
 
     rows = []
-    selected_records = []
+    natural_records = []
     for k, idx in enumerate(idxs):
         row = nat.iloc[idx].to_dict()
         stereo, sr = create_stereo_pair(row["participant1_relpath_abs"], row["participant2_relpath_abs"])
@@ -4074,14 +4074,14 @@ def sample_natural(
         row["natural_stem"] = stem
         row["natural_wav_path"] = str(wav_path.resolve())
         row["natural_json_path"] = str(json_path.resolve())
-        selected_records.append(row)
+        natural_records.append(row)
 
     manifest_dir = out_root / "manifests"
     write_manifest(manifest_dir / f"{split}.csv", rows)
     write_manifest(manifest_dir / f"{split}_all_sessions.csv", rows)
     if not (manifest_dir / "all_sessions.csv").exists():
         write_manifest(manifest_dir / "all_sessions.csv", rows)
-    pd.DataFrame(selected_records).to_csv(out_root / "selected_natural_rows.csv", index=False)
+    pd.DataFrame(natural_records).to_csv(out_root / "natural_rows.csv", index=False)
     print(f"Saved {len(rows)} natural pairs -> {out_root}")
 
 
@@ -4095,7 +4095,7 @@ def _read_json(path: str | Path) -> dict[str, Any]:
 def load_ordered_natural_sources(csv_path: Path) -> pd.DataFrame:
     """
     Supports two inputs:
-      1) selected_natural_rows.csv with participant*_relpath_abs columns
+      1) natural_rows.csv with participant*_relpath_abs columns
       2) natural manifest csv with audio_path/json_path columns; we recover participant abs from json
     """
     df = pd.read_csv(csv_path)
@@ -4201,31 +4201,31 @@ def _apply_edit_n_times(
     seed: int,
     min_required_edits: int = 1,
     hold_extension_ms: int = 800,
-    hold_shift_remove_pad_ms: float = 500.0,
+    hold_shift_remove_pad_ms: float = 100.0,
     hold_shift_max_gap_ms: float | None = None,
-    hold_shift_min_edited_hold_gap_ms: float = 100.0,
-    hold_shift_max_edited_hold_gap_ms: float | None = None,
-    hold_shift_min_responder_s: float = 1.0,
-    hold_shift_max_responder_s: float = 4.0,
+    hold_shift_min_edited_hold_gap_ms: float = 500.0,
+    hold_shift_max_edited_hold_gap_ms: float | None = 1500.0,
+    hold_shift_min_responder_s: float = 1.2,
+    hold_shift_max_responder_s: float = 8.0,
     hold_shift_require_return_proper: bool = False,
     shift_insert_gain: float = 0.9,
     shift_hold_pre_silence_ms: float = 1000.0,
     shift_hold_post_silence_ms: float = 1000.0,
-    shift_hold_min_gap_ms: float = 200.0,
+    shift_hold_min_gap_ms: float = 300.0,
     shift_hold_max_gap_ms: float = 1000.0,
     shift_hold_min_insert_s: float = 1.0,
     shift_hold_max_insert_s: float = 4.0,
-    bc_insert_gain: float = 0.85,
-    bc_insert_count: int = 1,
+    bc_insert_gain: float = 1.0,
+    bc_insert_count: int = 2,
     bc_insert_min_gap_ms: float = 800.0,
     bc_remove_count: int = 1,
     min_missed_backchannels: int = 1,
-    allow_bc_source_reuse: bool = True,
-    max_bc_source_reuse_per_clip: int = 1,
+    allow_bc_source_reuse: bool = False,
+    max_bc_source_reuse_per_clip: int = 0,
     allow_empty_bc_text: bool = False,
     p1_path: str | Path | None = None,
     p2_path: str | Path | None = None,
-    turn_source: str = "metadata",
+    turn_source: str = "silero",
     short_context: bool = False,
     min_context_s: float = 20.0,
     max_context_s: float = 25.0,
@@ -4524,33 +4524,33 @@ def make_unnatural(
     min_advance_ms: int,
     max_advance_ms: int,
     max_tries_per_type: int = 200,
-    edits_per_sample: int = 3,
+    edits_per_sample: int = 1,
     max_tries_per_sample: int = 40,
     edit_counts: str | None = None,
     hold_extension_ms: int = 800,
-    hold_shift_remove_pad_ms: float = 500.0,
+    hold_shift_remove_pad_ms: float = 100.0,
     hold_shift_max_gap_ms: float | None = None,
-    hold_shift_min_edited_hold_gap_ms: float = 100.0,
-    hold_shift_max_edited_hold_gap_ms: float | None = None,
-    hold_shift_min_responder_s: float = 1.0,
-    hold_shift_max_responder_s: float = 4.0,
+    hold_shift_min_edited_hold_gap_ms: float = 500.0,
+    hold_shift_max_edited_hold_gap_ms: float | None = 1500.0,
+    hold_shift_min_responder_s: float = 1.2,
+    hold_shift_max_responder_s: float = 8.0,
     hold_shift_require_return_proper: bool = False,
     shift_insert_gain: float = 0.9,
     shift_hold_pre_silence_ms: float = 1000.0,
     shift_hold_post_silence_ms: float = 1000.0,
-    shift_hold_min_gap_ms: float = 200.0,
+    shift_hold_min_gap_ms: float = 300.0,
     shift_hold_max_gap_ms: float = 1000.0,
     shift_hold_min_insert_s: float = 1.0,
     shift_hold_max_insert_s: float = 4.0,
-    bc_insert_gain: float = 0.85,
-    bc_insert_count: int = 1,
+    bc_insert_gain: float = 1.0,
+    bc_insert_count: int = 2,
     bc_insert_min_gap_ms: float = 800.0,
     bc_remove_count: int = 1,
     min_missed_backchannels: int = 1,
-    allow_bc_source_reuse: bool = True,
-    max_bc_source_reuse_per_clip: int = 1,
+    allow_bc_source_reuse: bool = False,
+    max_bc_source_reuse_per_clip: int = 0,
     allow_empty_bc_text: bool = False,
-    turn_source: str = "metadata",
+    turn_source: str = "silero",
     short_context: bool = False,
     min_context_s: float = 20.0,
     max_context_s: float = 25.0,
@@ -4632,7 +4632,7 @@ def make_unnatural(
     rows = []
     records = []
     failures: list[dict[str, Any]] = []
-    selection_log: list[dict[str, Any]] = []
+    generation_log: list[dict[str, Any]] = []
     used_source_indices: set[int] = set()
     failure_fields = [
         "source_natural_stem",
@@ -4679,7 +4679,7 @@ def make_unnatural(
                     src=source_stem[:24],
                     refresh=False,
                 )
-                selection_log.append({
+                generation_log.append({
                     "source_natural_stem": source_stem,
                     "source_natural_global_index": int(source_index),
                     "assigned_edit_type": edit_type,
@@ -4907,7 +4907,7 @@ def make_unnatural(
     write_manifest(manifest_dir / f"{split}.csv", rows)
     write_manifest(manifest_dir / f"{split}_all_sessions.csv", rows)
     pd.DataFrame(records).to_csv(out_root / f"generated_{split}_rows.csv", index=False)
-    pd.DataFrame(selection_log).to_csv(out_root / f"{split}_selection_log.csv", index=False)
+    pd.DataFrame(generation_log).to_csv(out_root / f"{split}_generation_log.csv", index=False)
     if failures:
         pd.DataFrame(failures).to_csv(out_root / f"{split}_failures.csv", index=False)
 
@@ -4992,8 +4992,6 @@ def generate_shift_hold_insert_time_sweep(
 
     The inserted audio block is copied from the base edited WAV and the paired
     natural reference is reused. The only intended variable is insertion time.
-    Run the VAP scorer on the emitted manifest, then select with
-    select_shift_hold_insert_time_sweep().
     """
     if step_ms <= 0:
         raise ValueError("--step-ms must be positive")
@@ -5097,7 +5095,7 @@ def generate_shift_hold_insert_time_sweep(
                 "window_ms": int(window_ms),
                 "min_delta_ms": int(lo_delta),
                 "max_delta_ms": int(hi_delta),
-                "selection_rule": "score all candidates; choose positive max delta_nll, else max delta_nll",
+                "generation_note": "insert-time sweep candidate generated without model scores",
             }
             cand_edit_meta = cand_meta.get("edit_meta", {})
             if isinstance(cand_edit_meta, dict):
@@ -5120,80 +5118,6 @@ def generate_shift_hold_insert_time_sweep(
     write_manifest(manifest_dir / f"{split}.csv", rows)
     write_manifest(manifest_dir / f"{split}_all_sessions.csv", rows)
     print(f"Wrote {len(rows)} shift-hold insert-time candidates -> {manifest_dir / f'{split}.csv'}")
-
-
-def _base_id_from_shift_insert_sweep(pair_id: str) -> str:
-    return re.sub(r"__(?:shift_insert|semantics_insert)_delta[mp]\d+ms$", "", str(pair_id))
-
-
-def select_shift_hold_insert_time_sweep(
-    *,
-    scores_csv: Path,
-    output_manifest: Path,
-    selection_json: Path,
-    top_k: int | None = None,
-) -> None:
-    """Select one candidate per base sample from scored insert-time sweep rows."""
-    df = pd.read_csv(scores_csv)
-    required = {"pair_id", "edited_audio_path", "delta_nll"}
-    missing = sorted(required - set(df.columns))
-    if missing:
-        raise ValueError(f"{scores_csv} missing columns: {missing}")
-    df = df.copy()
-    df["base_pair_id"] = df["pair_id"].map(_base_id_from_shift_insert_sweep)
-    df["delta_nll"] = pd.to_numeric(df["delta_nll"], errors="coerce")
-    selected_rows: list[dict[str, Any]] = []
-    selection_records: list[dict[str, Any]] = []
-
-    for base_id, group in df.groupby("base_pair_id", sort=False):
-        valid = group[group["delta_nll"].notna()].copy()
-        if valid.empty:
-            continue
-        positive = valid[valid["delta_nll"] > 0]
-        if not positive.empty:
-            chosen = positive.sort_values("delta_nll", ascending=False).iloc[0]
-            reason = "positive_delta_max"
-        else:
-            chosen = valid.sort_values("delta_nll", ascending=False).iloc[0]
-            reason = "fallback_max_delta_all_negative"
-        edited_audio = Path(str(chosen["edited_audio_path"]))
-        edited_json_raw = str(chosen.get("edited_json_path", "")).strip()
-        edited_json: Path | None = None
-        if edited_json_raw and edited_json_raw.lower() != "nan":
-            candidate_json = Path(edited_json_raw)
-            if candidate_json.is_file():
-                edited_json = candidate_json
-        if edited_json is None:
-            edited_json = Path(str(edited_audio).replace("/wav/", "/json/")).with_suffix(".json")
-        stem = str(chosen.get("edited_segment_id") or edited_audio.stem)
-        selected_rows.append(manifest_row(stem, edited_audio, edited_json, "selected"))
-        record = chosen.to_dict()
-        record["base_pair_id"] = base_id
-        record["selection_reason"] = reason
-        record["selected_audio_path"] = str(edited_audio)
-        record["selected_json_path"] = str(edited_json)
-        selection_records.append(record)
-
-    if top_k is not None and int(top_k) > 0:
-        ranked = sorted(
-            zip(selected_rows, selection_records),
-            key=lambda pair: float(pair[1].get("delta_nll", float("-inf"))),
-            reverse=True,
-        )[: int(top_k)]
-        selected_rows = [row for row, _ in ranked]
-        selection_records = [record for _, record in ranked]
-
-    write_manifest(output_manifest, selected_rows)
-    write_json(selection_json, {
-        "scores_csv": str(scores_csv.resolve()),
-        "output_manifest": str(output_manifest.resolve()),
-        "num_selected": len(selected_rows),
-        "top_k": int(top_k) if top_k is not None and int(top_k) > 0 else None,
-        "rule": "per base sample: if any candidate has delta_nll > 0, select max delta_nll among positives; otherwise select max delta_nll; optionally keep global top_k by selected delta_nll",
-        "selected": selection_records,
-    })
-    print(f"Selected {len(selected_rows)} candidates -> {output_manifest}")
-    print(f"Wrote selection details -> {selection_json}")
 
 
 def run_splice_self_tests() -> None:
@@ -5251,26 +5175,26 @@ def main() -> None:
     s2.add_argument("--seed", type=int, default=43)
     s2.add_argument("--frame-ms", type=float, default=80.0)
     s2.add_argument("--threshold", type=float, default=0.015)
-    s2.add_argument("--min-delay-ms", type=int, default=300)
-    s2.add_argument("--max-delay-ms", type=int, default=1000)
-    s2.add_argument("--min-advance-ms", type=int, default=200)
-    s2.add_argument("--max-advance-ms", type=int, default=800)
+    s2.add_argument("--min-delay-ms", type=int, default=1200)
+    s2.add_argument("--max-delay-ms", type=int, default=2000)
+    s2.add_argument("--min-advance-ms", type=int, default=1200)
+    s2.add_argument("--max-advance-ms", type=int, default=2500)
     s2.add_argument("--max-tries-per-type", type=int, default=200)
-    s2.add_argument("--edits-per-sample", type=int, default=3)
+    s2.add_argument("--edits-per-sample", type=int, default=1)
     s2.add_argument("--edit-counts", default=None, help="Comma-separated counts, e.g. 1,3,5; keeps same natural sources aligned across counts")
     s2.add_argument("--max-tries-per-sample", type=int, default=40)
     s2.add_argument("--hold-extension-ms", type=int, default=800)
-    s2.add_argument("--hold-shift-remove-pad-ms", type=float, default=500.0,
-                    help="Extra room-tone replacement pad around the removed responder turn for hold_instead_of_shift, clamped to neighboring turn boundaries. Default 500ms removes VAD-truncated tails more cleanly.")
+    s2.add_argument("--hold-shift-remove-pad-ms", type=float, default=100.0,
+                    help="Room-tone replacement pad around the removed responder turn for hold_instead_of_shift, clamped to neighboring turn boundaries.")
     s2.add_argument("--hold-shift-max-gap-ms", type=float, default=-1.0,
                     help="Optional maximum mutual-silence gap for the original A->B shift in hold_instead_of_shift. Default -1 disables this per-transition cap; use edited hold-gap constraints instead.")
-    s2.add_argument("--hold-shift-min-edited-hold-gap-ms", type=float, default=100.0,
-                    help="Minimum A-offset to next-A-onset gap after deleting the responder in hold_instead_of_shift. Default 100ms keeps a perceptible hold gap without requiring a long pause.")
-    s2.add_argument("--hold-shift-max-edited-hold-gap-ms", type=float, default=-1.0,
+    s2.add_argument("--hold-shift-min-edited-hold-gap-ms", type=float, default=500.0,
+                    help="Minimum A-offset to next-A-onset gap after deleting the responder in hold_instead_of_shift.")
+    s2.add_argument("--hold-shift-max-edited-hold-gap-ms", type=float, default=1500.0,
                     help="Maximum A-offset to next-A-onset gap after deleting the responder in hold_instead_of_shift; use -1 to disable.")
-    s2.add_argument("--hold-shift-min-responder-s", type=float, default=1.0,
-                    help="Minimum duration of the removed responder turn for hold_instead_of_shift. Default 1s to match the post-onset active-alone shift definition.")
-    s2.add_argument("--hold-shift-max-responder-s", type=float, default=4.0,
+    s2.add_argument("--hold-shift-min-responder-s", type=float, default=1.2,
+                    help="Minimum duration of the removed responder turn for hold_instead_of_shift.")
+    s2.add_argument("--hold-shift-max-responder-s", type=float, default=8.0,
                     help="Maximum duration of the removed responder turn for hold_instead_of_shift.")
     s2.add_argument("--hold-shift-require-return-proper", action="store_true",
                     help="Also require the original B->A return to be a strict proper transition. Default off; edited hold-gap constraints are usually cleaner.")
@@ -5279,7 +5203,7 @@ def main() -> None:
                     help="Legacy/no-op for shift_instead_of_hold. The 1s pre-offset active-alone guard is enforced by the proper HOLD detector; insertion uses the midpoint of the mutual-silence gap.")
     s2.add_argument("--shift-hold-post-silence-ms", type=float, default=1000.0,
                     help="Legacy/no-op for shift_instead_of_hold. The 1s post-onset active-alone guard is enforced by the proper HOLD detector; insertion uses the midpoint of the mutual-silence gap.")
-    s2.add_argument("--shift-hold-min-gap-ms", type=float, default=200.0,
+    s2.add_argument("--shift-hold-min-gap-ms", type=float, default=300.0,
                     help="Minimum original A-A hold gap used by shift_instead_of_hold.")
     s2.add_argument("--shift-hold-max-gap-ms", type=float, default=1000.0,
                     help="Maximum original A-A hold gap used by shift_instead_of_hold before inserting the shift turn.")
@@ -5287,8 +5211,8 @@ def main() -> None:
                     help="Minimum duration of the inserted shift turn for shift_instead_of_hold.")
     s2.add_argument("--shift-hold-max-insert-s", type=float, default=4.0,
                     help="Maximum duration of the inserted shift turn for shift_instead_of_hold.")
-    s2.add_argument("--bc-insert-gain", type=float, default=0.85)
-    s2.add_argument("--bc-insert-count", type=int, default=1,
+    s2.add_argument("--bc-insert-gain", type=float, default=1.0)
+    s2.add_argument("--bc-insert-count", type=int, default=2,
                     help="Number of copied backchannels inserted by one excessive_backchannel edit.")
     s2.add_argument("--bc-insert-min-gap-ms", type=float, default=800.0,
                     help="Minimum spacing between inserted excessive backchannels.")
@@ -5296,13 +5220,13 @@ def main() -> None:
                     help="Number of isolated backchannels removed by one missed_backchannel edit.")
     s2.add_argument("--min-missed-backchannels", type=int, default=1,
                     help="Require at least this many isolated backchannels before generating missed_backchannel.")
-    s2.add_argument("--allow-bc-source-reuse", action=argparse.BooleanOptionalAction, default=True,
-                    help="Allow excessive_backchannel to reuse source BC clips within --max-bc-source-reuse-per-clip. Default on with at most one reuse per clip.")
-    s2.add_argument("--max-bc-source-reuse-per-clip", type=int, default=1,
-                    help="Maximum number of times each source BC clip may be reused beyond its first use. Default 1 means a clip can appear at most twice.")
+    s2.add_argument("--allow-bc-source-reuse", action=argparse.BooleanOptionalAction, default=False,
+                    help="Allow excessive_backchannel to reuse source BC clips within --max-bc-source-reuse-per-clip. Default off keeps inserted BCs distinct when enough sources exist.")
+    s2.add_argument("--max-bc-source-reuse-per-clip", type=int, default=0,
+                    help="Maximum number of times each source BC clip may be reused beyond its first use.")
     s2.add_argument("--allow-empty-bc-text", action=argparse.BooleanOptionalAction, default=False,
                     help="Allow VAD-only backchannel clips with empty transcript text. Default off for auditable excessive_backchannel metadata.")
-    s2.add_argument("--turn-source", choices=["metadata", "metadata_vad", "silero", "rms"], default="metadata",
+    s2.add_argument("--turn-source", choices=["metadata", "metadata_vad", "silero", "rms"], default="silero",
                     help="Candidate turn source for unnatural edits. silero uses neural VAD boundaries plus transcript text; metadata uses sibling transcript/vad JSON; rms restores old RMS-VAD behavior.")
     s2.add_argument("--silero-threshold", type=float, default=SILERO_CONFIG["threshold"])
     s2.add_argument("--silero-min-speech-ms", type=float, default=SILERO_CONFIG["min_speech_ms"])
@@ -5372,15 +5296,6 @@ def main() -> None:
     s4.add_argument("--step-ms", type=int, default=100,
                     help="Insertion-time sweep step in ms.")
 
-    s5 = sub.add_parser("shift-hold-select-sweep")
-    s5.add_argument("--scores-csv", required=True,
-                    help="pair_scores.csv produced by score_vap_nll_naturalness.py on a shift-hold insert sweep manifest.")
-    s5.add_argument("--output-manifest", required=True,
-                    help="Manifest containing one selected candidate per base sample.")
-    s5.add_argument("--selection-json", required=True,
-                    help="JSON record with selected candidate details and selection rule.")
-    s5.add_argument("--top-k", type=int, default=None,
-                    help="After selecting one best candidate per base sample, keep only the global top K by delta_nll.")
 
     sub.add_parser("self-test-splice")
 
@@ -5420,13 +5335,6 @@ def main() -> None:
             step_ms=args.step_ms,
             min_delta_ms=args.min_delta_ms,
             max_delta_ms=args.max_delta_ms,
-        )
-    elif args.cmd == "shift-hold-select-sweep":
-        select_shift_hold_insert_time_sweep(
-            scores_csv=Path(args.scores_csv),
-            output_manifest=Path(args.output_manifest),
-            selection_json=Path(args.selection_json),
-            top_k=args.top_k,
         )
     else:
         make_unnatural(

@@ -1127,375 +1127,6 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerows(rows)
 
 
-class NaturalnessFiveTypeEvaluator:
-    def __init__(
-        self,
-        *,
-        manifest: Path,
-        output_dir: Path,
-        sample_rate: int,
-        samples_per_frame: int,
-        model_frame_hz: float,
-        bin_frames_50hz: list[int],
-        threshold_ratio: float,
-        bernoulli_head_reduction: str,
-        batch_size: int,
-        limit: int | None,
-        vad_source: str,
-        rms_threshold: float,
-        silero_threshold: float,
-        silero_min_speech_ms: int,
-        silero_min_silence_ms: int,
-        clean_min_speech_ms: int,
-        clean_min_silence_ms: int,
-        context_s: float,
-        tail_gamma: float,
-        lambda_mean: float,
-        unit_pre_s: float,
-        unit_post_s: float,
-        min_unit_frames: int,
-        min_utterance_s: float,
-        utterance_merge_gap_s: float,
-        utterance_merge_other_max_ratio: float,
-        unit_mode: str,
-    ) -> None:
-        from dualturn.scripts import evaluate_naturalness_5types as nat5
-        from dualturn.scripts import score_vap_nll_naturalness as vap_nll_base
-
-        if not manifest.is_file():
-            raise FileNotFoundError(manifest)
-        self.base = vap_nll_base
-        self.nat5 = nat5
-        self.manifest = manifest
-        self.output_dir = output_dir
-        self.sample_rate = int(sample_rate)
-        self.samples_per_frame = int(samples_per_frame)
-        self.model_frame_hz = float(model_frame_hz)
-        self.bin_frames_50hz = list(bin_frames_50hz)
-        self.threshold_ratio = float(threshold_ratio)
-        self.bernoulli_head_reduction = str(bernoulli_head_reduction)
-        if self.bernoulli_head_reduction not in {"mean", "sum"}:
-            raise ValueError(f"Invalid Bernoulli head reduction: {self.bernoulli_head_reduction}")
-        self.batch_size = int(batch_size)
-        self.vad_source = str(vad_source)
-        self.rms_threshold = float(rms_threshold)
-        self.silero_threshold = float(silero_threshold)
-        self.silero_min_speech_ms = int(silero_min_speech_ms)
-        self.silero_min_silence_ms = int(silero_min_silence_ms)
-        self.clean_min_speech_ms = int(clean_min_speech_ms)
-        self.clean_min_silence_ms = int(clean_min_silence_ms)
-        self.context_s = float(context_s)
-        self.tail_gamma = float(tail_gamma)
-        self.lambda_mean = float(lambda_mean)
-        self.unit_pre_s = float(unit_pre_s)
-        self.unit_post_s = float(unit_post_s)
-        self.min_unit_frames = int(min_unit_frames)
-        self.min_utterance_s = float(min_utterance_s)
-        self.utterance_merge_gap_s = float(utterance_merge_gap_s)
-        self.utterance_merge_other_max_ratio = float(utterance_merge_other_max_ratio)
-        self.unit_mode = str(unit_mode)
-        self.rows = self.base.read_manifest(manifest)
-        self.limit = limit
-        if limit is not None:
-            self.rows = self.rows[: int(limit)]
-        if self.batch_size < 1:
-            raise ValueError("naturalness batch_size must be >= 1")
-        self.silero_models = self.base.load_silero_models() if self.vad_source == "silero" else None
-        print(f"Naturalness 5types eval: {len(self.rows)} pairs from {manifest}; pair_batch_size={self.batch_size}")
-
-    def _pair_segments(self, row: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any]]:
-        session_id = str(row.get("session_id") or row.get("id") or Path(row["audio_path"]).stem)
-        pair_id = str(row.get("pair_id") or session_id)
-        edit_type = str(row.get("edit_type") or "")
-        natural_audio = Path(row.get("natural_audio_path") or "")
-        if not natural_audio:
-            meta = self.base.read_json(row["json_path"])
-            natural_audio = self.base.natural_reference_from_meta(meta, row["json_path"])
-        edited = {
-            "segment_id": session_id,
-            "condition": "edited",
-            "version": "edited",
-            "pair_id": pair_id,
-            "edit_type": edit_type,
-            "audio_path": Path(row["audio_path"]),
-        }
-        natural = {
-            "segment_id": f"{pair_id}__natural_ref_for__{session_id}",
-            "condition": "natural",
-            "version": "original",
-            "pair_id": pair_id,
-            "edit_type": edit_type,
-            "audio_path": natural_audio,
-        }
-        return natural, edited
-
-    def _prepare_segment(self, item: dict[str, Any]) -> dict[str, Any]:
-        model_audio = self.base.load_stereo_audio(Path(item["audio_path"]), self.sample_rate)
-        vad_audio = self.base.load_stereo_audio(Path(item["audio_path"]), 16_000)
-        duration_s = float(model_audio.shape[-1] / self.sample_rate)
-        vad_pack = self.base.observed_vad_50hz(
-            vad_audio,
-            sr=16_000,
-            vad_source=self.vad_source,
-            silero_models=self.silero_models,
-            rms_threshold=self.rms_threshold,
-            silero_threshold=self.silero_threshold,
-            silero_min_speech_ms=self.silero_min_speech_ms,
-            silero_min_silence_ms=self.silero_min_silence_ms,
-            clean_min_speech_ms=self.clean_min_speech_ms,
-            clean_min_silence_ms=self.clean_min_silence_ms,
-        )
-        units = self.base.extract_utterance_units(
-            vad_pack["clean"],
-            frame_hz=50.0,
-            duration_s=duration_s,
-            unit_pre_s=self.unit_pre_s,
-            unit_post_s=self.unit_post_s,
-            min_utterance_s=self.min_utterance_s,
-            unit_mode=self.unit_mode,
-            utterance_merge_gap_s=self.utterance_merge_gap_s,
-            utterance_merge_other_max_ratio=self.utterance_merge_other_max_ratio,
-        )
-        return {**item, "audio": model_audio, "duration_s": duration_s, "vad_clean": vad_pack["clean"], "units": units}
-
-    def _vad_to_model_frames(self, vad_50hz: np.ndarray, target_frames: int) -> np.ndarray:
-        out = np.zeros((target_frames, 2), dtype=np.int8)
-        if target_frames <= 0:
-            return out
-        for i in range(target_frames):
-            lo = int(math.floor(i * 50.0 / self.model_frame_hz))
-            hi = int(math.floor((i + 1) * 50.0 / self.model_frame_hz))
-            hi = max(hi, lo + 1)
-            if lo < vad_50hz.shape[0]:
-                out[i] = (vad_50hz[lo:min(hi, vad_50hz.shape[0])].mean(axis=0) >= 0.5).astype(np.int8)
-        return out
-
-    @torch.no_grad()
-    def _score_prepared_batch(
-        self,
-        model: nn.Module,
-        prepared: list[dict[str, Any]],
-        *,
-        device: torch.device,
-        use_autocast: bool,
-        autocast_dtype: torch.dtype | None,
-    ) -> list[dict[str, Any]]:
-        max_samples = max(int(item["audio"].shape[-1]) for item in prepared)
-        audio_batch = torch.stack([
-            F.pad(item["audio"], (0, max_samples - int(item["audio"].shape[-1])))
-            for item in prepared
-        ]).to(device)
-        with autocast(device_type=device.type, enabled=use_autocast, dtype=autocast_dtype):
-            logits_batch = model(audio_batch)
-        logits_batch = logits_batch.float()
-        results = []
-        for index, item in enumerate(prepared):
-            logits = logits_batch[index:index + 1]
-            T = int(logits.shape[1])
-            valid_frames = min(T, int(math.ceil(float(item["audio"].shape[-1]) / self.samples_per_frame)))
-            frame_valid_mask = torch.zeros((1, T), dtype=torch.float32, device=device)
-            frame_valid_mask[:, :valid_frames] = 1.0
-            vad_50 = torch.from_numpy(item["vad_clean"].T.astype(np.float32)).unsqueeze(0).to(device)
-            states, valid = fvad_targets(
-                vad_50,
-                frame_valid_mask,
-                self.bin_frames_50hz,
-                model_frame_hz=self.model_frame_hz,
-                threshold_ratio=self.threshold_ratio,
-                target_scheme=model.target_scheme,
-            )
-            n = min(T, int(states.shape[1]))
-            nll = np.full((n,), np.nan, dtype=np.float32)
-            targets = np.full((n,), IGNORE_INDEX, dtype=np.int64)
-            if n > 0:
-                states_n = states[:, :n]
-                valid_n = valid[:, :n]
-                if bool(valid_n.any()):
-                    powers = torch.tensor([1 << i for i in range(8)], dtype=torch.long, device=device)
-                    packed_targets = ((states_n >= self.threshold_ratio).long() * powers).sum(dim=-1)
-                    if model.objective_type == "categorical256":
-                        losses = F.cross_entropy(
-                            logits[:, :n].reshape(-1, logits.shape[-1]),
-                            packed_targets.reshape(-1),
-                            reduction="none",
-                        ).reshape(1, n)
-                    elif model.objective_type == "bernoulli8":
-                        per_bit_losses = F.binary_cross_entropy_with_logits(
-                            logits[:, :n], states_n, reduction="none"
-                        )
-                        if self.bernoulli_head_reduction == "sum":
-                            losses = per_bit_losses.sum(dim=-1)
-                        else:
-                            losses = per_bit_losses.mean(dim=-1)
-                    else:
-                        raise ValueError(f"Unsupported objective_type={model.objective_type}")
-                    valid_np = valid_n.squeeze(0).detach().cpu().numpy().astype(bool)
-                    nll[valid_np] = losses.squeeze(0).detach().cpu().numpy()[valid_np]
-                    targets[valid_np] = packed_targets.squeeze(0).detach().cpu().numpy()[valid_np]
-            vad_model = self._vad_to_model_frames(item["vad_clean"], len(nll))
-            unit_rows = self.base.unit_rows_from_units(
-                nll,
-                item["units"],
-                vad=vad_model,
-                segment_id=item["segment_id"],
-                frame_hz=self.model_frame_hz,
-                context_s=self.context_s,
-                min_unit_frames=self.min_unit_frames,
-            )
-            aggregate = self.base.aggregate_unit_rows(unit_rows, gamma=self.tail_gamma, lam=self.lambda_mean)
-            aggregate.update({
-                "segment_id": item["segment_id"],
-                "condition": item["condition"],
-                "version": item["version"],
-                "pair_id": item["pair_id"],
-                "edit_type": item["edit_type"],
-                "audio_path": str(item["audio_path"]),
-                "duration_s": item["duration_s"],
-                "num_nll_frames": int(np.isfinite(nll).sum()),
-                "units": unit_rows,
-                "targets": targets,
-            })
-            results.append(aggregate)
-        del audio_batch, logits_batch
-        return results
-
-    def _wandb_payload(self, flat_rows: list[dict[str, Any]]) -> dict[str, float | int]:
-        payload: dict[str, float | int] = {}
-        wanted = {
-            "natural_mean_nll_mean": "natural_mean_nll",
-            "edited_mean_nll_mean": "edited_mean_nll",
-            "delta_mean_nll_mean": "delta_mean_nll",
-            "natural_tail_nll_mean": "natural_tail_nll",
-            "edited_tail_nll_mean": "edited_tail_nll",
-            "delta_tail_nll_mean": "delta_tail_nll",
-            "natural_dialogue_nll_mean": "natural_dialogue_nll",
-            "edited_dialogue_nll_mean": "edited_dialogue_nll",
-            "delta_nll_mean": "delta_nll",
-            "pairwise_accuracy": "pairwise_acc",
-            "c_index": "c_index",
-            "n": "n",
-        }
-        for row in flat_rows:
-            label = str(row["type"])
-            prefix = f"naturalness/{label}"
-            for src, dst in wanted.items():
-                value = row.get(src)
-                if isinstance(value, (int, float)) and math.isfinite(float(value)):
-                    payload[f"{prefix}/{dst}"] = float(value) if src != "n" else int(value)
-        return payload
-
-    @torch.no_grad()
-    def run(
-        self,
-        model: nn.Module,
-        *,
-        device: torch.device,
-        epoch: int | None,
-        global_step: int,
-        use_autocast: bool,
-        autocast_dtype: torch.dtype | None,
-    ) -> dict[str, Any]:
-        was_training = model.training
-        model.eval()
-        pair_rows: list[dict[str, Any]] = []
-        segment_rows: list[dict[str, Any]] = []
-        unit_rows: list[dict[str, Any]] = []
-        for batch_start in tqdm(range(0, len(self.rows), self.batch_size), desc=f"naturalness step{global_step}", leave=False):
-            batch_rows = self.rows[batch_start:batch_start + self.batch_size]
-            infos = [self._pair_segments(row) for row in batch_rows]
-            prepared = []
-            for natural, edited in infos:
-                prepared.append(self._prepare_segment(natural))
-                prepared.append(self._prepare_segment(edited))
-            scored = self._score_prepared_batch(
-                model,
-                prepared,
-                device=device,
-                use_autocast=use_autocast,
-                autocast_dtype=autocast_dtype,
-            )
-            for local_index, (natural_info, edited_info) in enumerate(infos):
-                natural = scored[2 * local_index]
-                edited = scored[2 * local_index + 1]
-                for segment in (natural, edited):
-                    segment_rows.append({
-                        "segment_id": segment["segment_id"],
-                        "condition": segment["condition"],
-                        "pair_id": segment["pair_id"],
-                        "version": segment["version"],
-                        "edit_type": segment["edit_type"],
-                        "audio_path": segment["audio_path"],
-                        "duration_s": segment["duration_s"],
-                        "mean_nll": segment["mean_nll"],
-                        "tail_nll": segment["tail_nll"],
-                        "dialog_nll": segment["dialog_nll"],
-                        "nat_score": segment["nat_score"],
-                        "num_units": segment["num_units"],
-                        "tail_k": segment["tail_k"],
-                        "num_nll_frames": segment["num_nll_frames"],
-                    })
-                    unit_rows.extend(segment["units"])
-                delta_nll = float(edited["dialog_nll"]) - float(natural["dialog_nll"])
-                pair_rows.append({
-                    "pair_id": natural["pair_id"],
-                    "edit_type": natural["edit_type"],
-                    "original_segment_id": natural["segment_id"],
-                    "edited_segment_id": edited["segment_id"],
-                    "original_audio_path": natural["audio_path"],
-                    "edited_audio_path": edited["audio_path"],
-                    "original_mean_nll": natural["mean_nll"],
-                    "original_tail_nll": natural["tail_nll"],
-                    "original_dialog_nll": natural["dialog_nll"],
-                    "edited_mean_nll": edited["mean_nll"],
-                    "edited_tail_nll": edited["tail_nll"],
-                    "edited_dialog_nll": edited["dialog_nll"],
-                    "delta_nll": delta_nll,
-                    "edited_more_unnatural": bool(delta_nll > 0),
-                    "original_num_units": natural["num_units"],
-                    "edited_num_units": edited["num_units"],
-                })
-            del prepared, scored
-        by_type: dict[str, list[dict[str, Any]]] = {}
-        for row in pair_rows:
-            by_type.setdefault(str(row["edit_type"]), []).append(row)
-        expected_all = list(self.nat5.TYPE_ORDER)
-        expected = expected_all if self.limit is None else [name for name in expected_all if name in by_type]
-        missing = [name for name in expected if name not in by_type]
-        unexpected = sorted(set(by_type) - set(expected_all))
-        if missing or unexpected:
-            raise ValueError(f"Naturalness type mismatch: missing={missing}, unexpected={unexpected}")
-        summaries = {name: self.nat5.summarize(by_type[name]) for name in expected}
-        summaries["overall"] = self.nat5.summarize(pair_rows)
-        flat_rows = [self.nat5.flatten(name, summaries[name]) for name in expected]
-        flat_rows.append(self.nat5.flatten("overall", summaries["overall"]))
-        out_dir = self.output_dir / f"step_{global_step:08d}"
-        _write_csv(out_dir / "pair_scores.csv", pair_rows)
-        _write_csv(out_dir / "segment_scores.csv", segment_rows)
-        _write_csv(out_dir / "units.csv", unit_rows)
-        _write_csv(out_dir / "metrics.csv", flat_rows)
-        payload = {
-            "metric": "future_vad_naturalness_5types",
-            "objective_type": model.objective_type,
-            "fvad_target_scheme": model.target_scheme,
-            "frame_nll_reduction": (
-                "categorical_ce" if model.objective_type == "categorical256"
-                else f"bernoulli_{self.bernoulli_head_reduction}"
-            ),
-            "epoch": epoch,
-            "global_step": global_step,
-            "manifest": str(self.manifest),
-            "model_frame_hz": self.model_frame_hz,
-            "label_frame_hz": 50.0,
-            "num_pairs": len(pair_rows),
-            "batch_size": self.batch_size,
-            "by_type": {name: summaries[name] for name in expected},
-            "overall": summaries["overall"],
-        }
-        (out_dir / "metrics.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        if was_training:
-            model.train(True)
-        return {"summary": payload, "flat_rows": flat_rows, "wandb": self._wandb_payload(flat_rows), "output_dir": str(out_dir)}
-
 def run_epoch(
     *,
     model: nn.Module,
@@ -1522,12 +1153,6 @@ def run_epoch(
     eval_loaders: dict[str, DataLoader] | None = None,
     eval_max_batches: int | None = None,
     eval_history: list[dict[str, Any]] | None = None,
-    naturalness_evaluator: NaturalnessFiveTypeEvaluator | None = None,
-    naturalness_every_steps: int = 0,
-    naturalness_history: list[dict[str, Any]] | None = None,
-    naturalness_checkpoint_metric: str = "none",
-    naturalness_best_state: dict[str, float | int] | None = None,
-    checkpoint_dir: Path | None = None,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -1703,14 +1328,7 @@ def run_epoch(
             and eval_loaders
             and global_step % eval_every_steps == 0
         )
-        do_naturalness_eval = (
-            training
-            and global_step is not None
-            and naturalness_evaluator is not None
-            and naturalness_every_steps > 0
-            and global_step % naturalness_every_steps == 0
-        )
-        if do_loss_eval or do_naturalness_eval:
+        if do_loss_eval:
             print(f"\n[future-VAD] mid-epoch eval at global_step={global_step}")
             eval_row: dict[str, Any] = {"epoch": epoch, "global_step": global_step, "eval": {}}
             if do_loss_eval and eval_loaders:
@@ -1751,52 +1369,6 @@ def run_epoch(
                                 "global_step": global_step,
                             },
                             step=global_step,
-                        )
-            if do_naturalness_eval and naturalness_evaluator is not None:
-                print(f"[future-VAD] naturalness 5types eval at global_step={global_step}")
-                nat_metrics = naturalness_evaluator.run(
-                    model,
-                    device=device,
-                    epoch=epoch,
-                    global_step=global_step,
-                    use_autocast=use_autocast,
-                    autocast_dtype=autocast_dtype,
-                )
-                eval_row["naturalness_5types"] = nat_metrics["summary"]
-                print(f"naturalness_5types saved -> {nat_metrics['output_dir']}")
-                if wandb_run is not None:
-                    payload = dict(nat_metrics["wandb"])
-                    payload.update({"epoch": epoch, "global_step": global_step})
-                    wandb_run.log(payload, step=global_step)
-                if naturalness_history is not None:
-                    naturalness_history.append(nat_metrics["summary"])
-                if (
-                    naturalness_checkpoint_metric != "none"
-                    and naturalness_best_state is not None
-                    and checkpoint_dir is not None
-                    and optimizer is not None
-                ):
-                    metric_value = float(
-                        nat_metrics["summary"]["overall"][naturalness_checkpoint_metric]
-                    )
-                    if metric_value > float(naturalness_best_state.get("value", float("-inf"))):
-                        naturalness_best_state.update({"value": metric_value, "global_step": global_step})
-                        checkpoint_path = checkpoint_dir / f"best_naturalness_{naturalness_checkpoint_metric}.pt"
-                        save_checkpoint(
-                            checkpoint_path,
-                            {
-                                "epoch": epoch,
-                                "global_step": global_step,
-                                "model_state": model.state_dict(),
-                                "optimizer_state": optimizer.state_dict(),
-                                "args": getattr(model, "checkpoint_args", {}),
-                                "naturalness_metric": naturalness_checkpoint_metric,
-                                "naturalness_metric_value": metric_value,
-                            },
-                        )
-                        print(
-                            f"Saved best trained naturalness checkpoint: {checkpoint_path} "
-                            f"({naturalness_checkpoint_metric}={metric_value:.6f})"
                         )
             if eval_history is not None:
                 eval_history.append(eval_row)
@@ -1978,35 +1550,6 @@ def main() -> None:
     ap.add_argument("--max-val-batches", type=int, default=None)
     ap.add_argument("--max-mid-eval-batches", type=int, default=None)
     ap.add_argument("--eval-every-steps", type=int, default=0)
-    ap.add_argument("--naturalness-manifest", type=Path, default=None)
-    ap.add_argument("--naturalness-output-dir", type=Path, default=None)
-    ap.add_argument("--naturalness-eval-every-steps", type=int, default=0)
-    ap.add_argument("--naturalness-eval-at-start", action="store_true")
-    ap.add_argument(
-        "--naturalness-checkpoint-metric",
-        choices=["none", "pairwise_accuracy", "c_index"],
-        default="none",
-    )
-    ap.add_argument("--naturalness-batch-size", type=int, default=4)
-    ap.add_argument("--naturalness-limit", type=int, default=None)
-    ap.add_argument(
-        "--naturalness-bernoulli-reduction",
-        choices=["mean", "sum"],
-        default="sum",
-        help="Use sum for an 8-bit factorized joint NLL comparable in scale to 256-way CE.",
-    )
-    ap.add_argument("--naturalness-vad-source", choices=["silero", "rms"], default="silero")
-    ap.add_argument("--naturalness-rms-threshold", type=float, default=0.015)
-    ap.add_argument("--naturalness-context-s", type=float, default=3.0)
-    ap.add_argument("--naturalness-tail-gamma", type=float, default=0.25)
-    ap.add_argument("--naturalness-lambda-mean", type=float, default=0.5)
-    ap.add_argument("--naturalness-unit-pre-s", type=float, default=2.0)
-    ap.add_argument("--naturalness-unit-post-s", type=float, default=0.0)
-    ap.add_argument("--naturalness-min-unit-frames", type=int, default=5)
-    ap.add_argument("--naturalness-min-utterance-s", type=float, default=0.5)
-    ap.add_argument("--naturalness-utterance-merge-gap-s", type=float, default=1.0)
-    ap.add_argument("--naturalness-utterance-merge-other-max-ratio", type=float, default=0.2)
-    ap.add_argument("--naturalness-unit-mode", choices=["boundaries", "spans", "both"], default="boundaries")
     ap.add_argument("--device", default=None)
     ap.add_argument("--wandb-project", default=None)
     ap.add_argument("--wandb-run-name", default=None)
@@ -2170,13 +1713,6 @@ def main() -> None:
                 "wandb_log_every": args.wandb_log_every,
                 "eval_every_steps": args.eval_every_steps,
                 "max_mid_eval_batches": args.max_mid_eval_batches,
-                "naturalness_manifest": str(args.naturalness_manifest) if args.naturalness_manifest is not None else None,
-                "naturalness_eval_every_steps": args.naturalness_eval_every_steps,
-                "naturalness_eval_at_start": args.naturalness_eval_at_start,
-                "naturalness_checkpoint_metric": args.naturalness_checkpoint_metric,
-                "naturalness_batch_size": args.naturalness_batch_size,
-                "naturalness_limit": args.naturalness_limit,
-                "naturalness_bernoulli_reduction": args.naturalness_bernoulli_reduction,
             },
         )
 
@@ -2206,42 +1742,6 @@ def main() -> None:
     use_amp, amp_dtype, use_scaler = precision_policy(str(cfg["precision"].get("mode", "bf16")), device)
     scaler = GradScaler(device.type, enabled=use_scaler)
 
-    naturalness_evaluator = None
-    if args.naturalness_manifest is not None and (
-        args.naturalness_eval_every_steps > 0 or args.naturalness_eval_at_start
-    ):
-        nat_out = args.naturalness_output_dir
-        if nat_out is None:
-            nat_out = Path(cfg["paths"]["output_dir"]) / "artifacts" / "naturalness_5types"
-        naturalness_evaluator = NaturalnessFiveTypeEvaluator(
-            manifest=args.naturalness_manifest,
-            output_dir=nat_out,
-            sample_rate=int(cfg["data"]["target_sample_rate"]),
-            samples_per_frame=int(cfg["data"]["samples_per_frame"]),
-            model_frame_hz=frame_hz,
-            bin_frames_50hz=bin_frames,
-            threshold_ratio=args.threshold_ratio,
-            bernoulli_head_reduction=args.naturalness_bernoulli_reduction,
-            batch_size=args.naturalness_batch_size,
-            limit=args.naturalness_limit,
-            vad_source=args.naturalness_vad_source,
-            rms_threshold=args.naturalness_rms_threshold,
-            silero_threshold=args.silero_threshold,
-            silero_min_speech_ms=args.silero_min_speech_ms,
-            silero_min_silence_ms=args.silero_min_silence_ms,
-            clean_min_speech_ms=args.clean_min_speech_ms,
-            clean_min_silence_ms=args.clean_min_silence_ms,
-            context_s=args.naturalness_context_s,
-            tail_gamma=args.naturalness_tail_gamma,
-            lambda_mean=args.naturalness_lambda_mean,
-            unit_pre_s=args.naturalness_unit_pre_s,
-            unit_post_s=args.naturalness_unit_post_s,
-            min_unit_frames=args.naturalness_min_unit_frames,
-            min_utterance_s=args.naturalness_min_utterance_s,
-            utterance_merge_gap_s=args.naturalness_utterance_merge_gap_s,
-            utterance_merge_other_max_ratio=args.naturalness_utterance_merge_other_max_ratio,
-            unit_mode=args.naturalness_unit_mode,
-        )
 
     if resume_payload is not None and "optimizer_state" in resume_payload:
         optimizer.load_state_dict(resume_payload["optimizer_state"])
@@ -2282,14 +1782,6 @@ def main() -> None:
             "test1_manifest": str(args.test1_manifest) if args.test1_manifest is not None else None,
             "eval_every_steps": args.eval_every_steps,
             "max_mid_eval_batches": args.max_mid_eval_batches,
-            "naturalness_manifest": str(args.naturalness_manifest) if args.naturalness_manifest is not None else None,
-            "naturalness_output_dir": str(args.naturalness_output_dir) if args.naturalness_output_dir is not None else None,
-            "naturalness_eval_every_steps": args.naturalness_eval_every_steps,
-            "naturalness_eval_at_start": args.naturalness_eval_at_start,
-            "naturalness_checkpoint_metric": args.naturalness_checkpoint_metric,
-            "naturalness_batch_size": args.naturalness_batch_size,
-            "naturalness_limit": args.naturalness_limit,
-            "naturalness_bernoulli_reduction": args.naturalness_bernoulli_reduction,
             "frame_hz": frame_hz,
             "vap_bin_times": args.vap_bin_times,
             "vap_bin_frames_50hz": bin_frames,
@@ -2322,36 +1814,10 @@ def main() -> None:
     if resume_payload is not None and prior_history_path.is_file():
         prior_artifacts = json.loads(prior_history_path.read_text(encoding="utf-8"))
     mid_eval_history: list[dict[str, Any]] = list(prior_artifacts.get("mid_eval_history", []))
-    naturalness_history: list[dict[str, Any]] = list(prior_artifacts.get("naturalness_history", []))
-    naturalness_best_state: dict[str, float | int] = {"value": float("-inf"), "global_step": -1}
-    if args.naturalness_checkpoint_metric != "none":
-        for row in naturalness_history:
-            value = row.get("overall", {}).get(args.naturalness_checkpoint_metric)
-            if value is not None and float(value) > float(naturalness_best_state["value"]):
-                naturalness_best_state = {
-                    "value": float(value),
-                    "global_step": int(row.get("global_step", -1)),
-                }
     eval_loaders = {"dev": val_loader}
     if test1_loader is not None:
         eval_loaders["test1"] = test1_loader
 
-    if naturalness_evaluator is not None and args.naturalness_eval_at_start and resume_payload is None:
-        print("\n[future-VAD] naturalness baseline before training (global_step=0)")
-        baseline = naturalness_evaluator.run(
-            model,
-            device=device,
-            epoch=0,
-            global_step=0,
-            use_autocast=use_amp,
-            autocast_dtype=amp_dtype,
-        )
-        naturalness_history.append(baseline["summary"])
-        print(f"naturalness baseline saved -> {baseline['output_dir']}")
-        if wandb_run is not None:
-            payload = dict(baseline["wandb"])
-            payload.update({"epoch": 0, "global_step": 0})
-            wandb_run.log(payload, step=0)
 
     for epoch in range(start_epoch, int(args.epochs) + 1):
         print(f"\n[future-VAD] epoch {epoch}/{args.epochs}")
@@ -2380,12 +1846,6 @@ def main() -> None:
             eval_loaders=eval_loaders,
             eval_max_batches=args.max_mid_eval_batches,
             eval_history=mid_eval_history,
-            naturalness_evaluator=naturalness_evaluator,
-            naturalness_every_steps=args.naturalness_eval_every_steps,
-            naturalness_history=naturalness_history,
-            naturalness_checkpoint_metric=args.naturalness_checkpoint_metric,
-            naturalness_best_state=naturalness_best_state,
-            checkpoint_dir=ckpt_dir,
         )
         with torch.no_grad():
             val_metrics = run_epoch(
@@ -2503,7 +1963,7 @@ def main() -> None:
 
     save_json(
         Path(cfg["paths"]["output_dir"]) / "artifacts" / "history.json",
-        {"history": history, "mid_eval_history": mid_eval_history, "naturalness_history": naturalness_history},
+        {"history": history, "mid_eval_history": mid_eval_history},
     )
     if wandb_run is not None:
         wandb_run.finish()

@@ -60,8 +60,6 @@ def main() -> None:
         "args": saved_args,
         "epoch": source.get("epoch"),
         "global_step": source.get("global_step"),
-        "naturalness_metric": source.get("naturalness_metric"),
-        "naturalness_metric_value": source.get("naturalness_metric_value"),
         "source_checkpoint": args.input.name,
         "experiment": args.experiment,
     }
