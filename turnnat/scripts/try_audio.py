@@ -289,7 +289,7 @@ def run_perturb_and_score(args: argparse.Namespace) -> None:
     perturb_dir = args.output_dir / "generated"
     cmd = [
         sys.executable,
-        str(PROJECT_ROOT / "natural_classification" / "build_natural_unnatural_dualturn.py"),
+        str(PROJECT_ROOT / "turnnat" / "scripts" / "build_perturbations.py"),
         "make-unnatural",
         "--natural-csv", str(args.natural_csv),
         "--out-root", str(perturb_dir),
@@ -310,7 +310,7 @@ def run_perturb_and_score(args: argparse.Namespace) -> None:
         if args.checkpoint is None:
             raise ValueError("--checkpoint is required to score generated perturbations with official-vap")
         score_cmd = [
-            sys.executable, str(PROJECT_ROOT / "dualturn" / "scripts" / "score_vap_nll_naturalness.py"),
+            sys.executable, str(PROJECT_ROOT / "turnnat" / "scripts" / "score_vap_nll_naturalness.py"),
             "--unnatural-manifest", str(manifest),
             "--checkpoint", str(args.checkpoint),
             "--output-dir", str(score_dir),
@@ -322,7 +322,7 @@ def run_perturb_and_score(args: argparse.Namespace) -> None:
         ]
     elif args.score_backend == "official-dualturn":
         score_cmd = [
-            sys.executable, str(PROJECT_ROOT / "dualturn" / "scripts" / "score_dualturn_fvad_nll_naturalness.py"),
+            sys.executable, str(PROJECT_ROOT / "turnnat" / "scripts" / "score_dualturn_fvad_nll_naturalness.py"),
             "--unnatural-manifest", str(manifest),
             "--output-dir", str(score_dir),
             "--model-id", args.model_id,
@@ -337,7 +337,7 @@ def run_perturb_and_score(args: argparse.Namespace) -> None:
         if args.checkpoint is None:
             raise ValueError("--checkpoint is required to score generated perturbations with fvad-checkpoint")
         score_cmd = [
-            sys.executable, str(PROJECT_ROOT / "dualturn" / "scripts" / "score_fvad_checkpoint.py"),
+            sys.executable, str(PROJECT_ROOT / "turnnat" / "scripts" / "score_fvad_checkpoint.py"),
             "--checkpoint", str(args.checkpoint),
             "--experiment", args.experiment,
             "--manifest", str(manifest),

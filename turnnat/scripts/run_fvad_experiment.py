@@ -10,7 +10,7 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-TRAIN_SCRIPT = PROJECT_ROOT / "dualturn" / "scripts" / "train_fvad_head.py"
+TRAIN_SCRIPT = PROJECT_ROOT / "turnnat" / "scripts" / "train_fvad_head.py"
 
 
 def main() -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from dualturn.utils import load_yaml
+from turnnat.utils import load_yaml
 
 
 def _resolve_refs(obj: Any, root: dict[str, Any]) -> Any:

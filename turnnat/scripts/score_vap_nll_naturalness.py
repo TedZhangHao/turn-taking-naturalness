@@ -29,8 +29,9 @@ if str(VAP_ROOT) not in sys.path:
 
 
 DEFAULT_UNNATURAL = REPO_ROOT / "dataset" / "manifests" / "unnatural_roomtone_normalized_45s_1.csv"
-DEFAULT_OUT = REPO_ROOT / "dualturn" / "outputs" / "vap_nll_naturalness"
+DEFAULT_OUT = REPO_ROOT / "turnnat" / "outputs" / "vap_nll_naturalness"
 DEFAULT_CKPT = REPO_ROOT / "VAP-main" / "example" / "checkpoints" / "VAP_state_dict.pt"
+VAP_STATE_DICT_URL = "https://github.com/ErikEkstedt/VAP/raw/main/example/checkpoints/VAP_state_dict.pt"
 FRAME_HZ = 50.0
 
 
@@ -56,7 +57,11 @@ def load_vap_model(ckpt: Path, device: torch.device):
     from vap.modules.modules import TransformerStereo
 
     if not ckpt.exists():
-        raise FileNotFoundError(f"Missing VAP checkpoint: {ckpt}")
+        raise FileNotFoundError(
+            f"Missing VAP checkpoint: {ckpt}. Download it with:\n"
+            f"  mkdir -p {ckpt.parent}\n"
+            f"  curl -L {VAP_STATE_DICT_URL} -o {ckpt}"
+        )
     model = VAP(EncoderCPC(), TransformerStereo())
     try:
         state = torch.load(str(ckpt), map_location="cpu", weights_only=True)

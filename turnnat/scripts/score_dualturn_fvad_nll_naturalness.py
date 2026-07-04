@@ -41,7 +41,7 @@ from score_vap_nll_naturalness import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_OUT = REPO_ROOT / "dualturn" / "outputs" / "dualturn_fvad_nll_naturalness"
+DEFAULT_OUT = REPO_ROOT / "turnnat" / "outputs" / "dualturn_fvad_nll_naturalness"
 DEFAULT_MODEL_ID = "anyreach-ai/dualturn-qwen2.5-mimi-0.5B"
 FRAME_RATE = 12.5
 SAMPLES_PER_FRAME = 1920  # 24 kHz / 12.5 Hz
@@ -64,7 +64,7 @@ def load_audio(path: Path, target_sr: int = 24_000) -> torch.Tensor:
 
 def load_dualturn_model(model_id: str, device: torch.device, *, local_files_only: bool) -> torch.nn.Module:
     # SCRIPT_DIR is inserted into sys.path above. Importing through
-    # ``dualturn.scripts`` fails because scripts/ is intentionally not a package.
+    # ``turnnat.scripts`` fails because scripts/ is intentionally not a package.
     from train_fvad_head import OfficialDualTurnFVADModel
 
     model = OfficialDualTurnFVADModel(

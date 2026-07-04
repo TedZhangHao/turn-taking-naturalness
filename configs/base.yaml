@@ -20,8 +20,6 @@ data:
   eval_batch_size: 4
   num_workers: 4
   pin_memory: true
-  vad:
-    rms_threshold: 0.015
 
 model:
   head_dropout: 0.1

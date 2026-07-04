@@ -58,8 +58,8 @@ class NaturalnessFiveTypeEvaluator:
         utterance_merge_other_max_ratio: float,
         unit_mode: str,
     ) -> None:
-        from dualturn.scripts import evaluate_naturalness_5types as nat5
-        from dualturn.scripts import score_vap_nll_naturalness as vap_nll_base
+        from turnnat.scripts import evaluate_naturalness_5types as nat5
+        from turnnat.scripts import score_vap_nll_naturalness as vap_nll_base
 
         if not manifest.is_file():
             raise FileNotFoundError(manifest)

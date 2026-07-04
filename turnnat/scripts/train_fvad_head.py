@@ -25,12 +25,13 @@ for path in [PROJECT_ROOT, VAP_ROOT]:
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from dualturn.config import ensure_output_dirs, load_config
-from dualturn.data.dataset import OtoSpeechChunkDataset, collate_chunks
-from dualturn.utils import count_trainable_parameters, save_json, set_seed
+from turnnat.config import ensure_output_dirs, load_config
+from turnnat.data.dataset import StereoChunkDataset, collate_chunks
+from turnnat.utils import count_trainable_parameters, save_json, set_seed
 
 
 DEFAULT_VAP_CKPT = PROJECT_ROOT / "VAP-main" / "example" / "checkpoints" / "VAP_state_dict.pt"
+VAP_STATE_DICT_URL = "https://github.com/ErikEkstedt/VAP/raw/main/example/checkpoints/VAP_state_dict.pt"
 DEFAULT_DUALTURN_MODEL_ID = "anyreach-ai/dualturn-qwen2.5-mimi-0.5B"
 DEFAULT_VAP_BIN_TIMES = [0.2, 0.4, 0.6, 0.8]
 IGNORE_INDEX = -100
@@ -73,7 +74,11 @@ class VAP256Model(nn.Module):
         if ckpt is not None:
             ckpt_path = Path(ckpt)
             if not ckpt_path.exists():
-                raise FileNotFoundError(f"Missing VAP checkpoint: {ckpt_path}")
+                raise FileNotFoundError(
+                    f"Missing VAP checkpoint: {ckpt_path}. Download it with:\n"
+                    f"  mkdir -p {ckpt_path.parent}\n"
+                    f"  curl -L {VAP_STATE_DICT_URL} -o {ckpt_path}"
+                )
             try:
                 state = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
             except TypeError:
@@ -432,7 +437,7 @@ class MimiFeatureChunkDataset(Dataset):
     """Chunk index for precomputed Mimi training without repeatedly reading WAV files."""
 
     def __init__(self, manifest_path: str, cfg: dict[str, Any], *, training: bool) -> None:
-        from dualturn.data.manifest import load_manifest
+        from turnnat.data.manifest import load_manifest
 
         self.rows = load_manifest(manifest_path)
         self.sample_rate = int(cfg["data"]["target_sample_rate"])
@@ -564,11 +569,11 @@ def resample_vad_50hz(vad_50hz: torch.Tensor, target_frames: int, target_frame_h
 
 
 class OfficialVadLabeler:
-    """Build binary VAD labels without using the dataset RMS fallback.
+    """Build the shared 50 Hz binary VAD labels used by all FVAD targets.
 
-    VAP official training consumes precomputed vad_list segments and converts them to
-    frame one-hot labels. OtoSpeech manifests here do not contain those segments, so
-    the reproducible official source for this data is DualTurn's Silero preprocessing.
+    The public training path follows the paper pipeline: obtain per-channel
+    Silero VAD, clean short speech/silence islands, then adapt that same VAD
+    stream to the VAP and DualTurn frame grids.
     """
 
     def __init__(
@@ -603,10 +608,8 @@ class OfficialVadLabeler:
 
             self.models = [load_silero_vad().eval(), load_silero_vad().eval()]
             print("VAD label source: Silero official DualTurn preprocessing")
-        elif source == "dataset":
-            print("VAD label source: dataset signal_targets (debug fallback; may be RMS)")
         else:
-            raise ValueError(f"Unsupported vad_source={source}")
+            raise ValueError(f"Unsupported vad_source={source}; public training supports source='silero'")
 
     @torch.no_grad()
 
@@ -641,9 +644,6 @@ class OfficialVadLabeler:
     def __call__(self, batch: dict[str, Any], device: torch.device) -> torch.Tensor:
         if self.cache_dir is not None:
             return self._cached_batch(batch, device)
-        if self.source == "dataset":
-            return batch["signal_targets"]["vad"].to(device)
-
         from silero_vad import get_speech_timestamps
 
         audio = batch["audio"].detach().float().cpu()
@@ -918,7 +918,7 @@ def dualturn_event_targets(
     threshold_ratio: float,
 ) -> dict[str, torch.Tensor]:
     """Derive the official-style VAD/EOT/HOLD/BOT/BC pseudo-labels from shared VAD."""
-    from dualturn.data.vad import derive_signals
+    from turnnat.data.vad import derive_signals
 
     vad = vad50_to_model_vad(
         vad_50hz,
@@ -1539,7 +1539,7 @@ def main() -> None:
     ap.add_argument("--vap-bin-times", type=parse_float_list, default=DEFAULT_VAP_BIN_TIMES)
     ap.add_argument("--threshold-ratio", type=float, default=0.5)
     ap.add_argument("--context-seconds", type=float, default=0.0)
-    ap.add_argument("--vad-source", choices=["silero", "dataset"], default="silero")
+    ap.add_argument("--vad-source", choices=["silero"], default="silero")
     ap.add_argument("--vad-cache-dir", type=Path, default=None)
     ap.add_argument("--silero-threshold", type=float, default=0.5)
     ap.add_argument("--silero-min-speech-ms", type=int, default=100)
@@ -1572,20 +1572,13 @@ def main() -> None:
     using_mimi_features = args.backbone == "dualturn" and args.mimi_feature_root is not None
     if using_mimi_features and args.vad_cache_dir is None:
         raise ValueError("--mimi-feature-root requires --vad-cache-dir so training never falls back to WAV VAD")
-    dataset_cls = MimiFeatureChunkDataset if using_mimi_features else OtoSpeechChunkDataset
+    dataset_cls = MimiFeatureChunkDataset if using_mimi_features else StereoChunkDataset
     collate_fn = collate_mimi_feature_chunks if using_mimi_features else collate_chunks
-    if using_mimi_features:
-        train_ds = dataset_cls(cfg["data"]["train_manifest"], cfg, training=True)
-        val_ds = dataset_cls(cfg["data"]["val_manifest"], cfg, training=False)
-    else:
-        train_ds = dataset_cls(cfg["data"]["train_manifest"], cfg, stage="stage2", training=True)
-        val_ds = dataset_cls(cfg["data"]["val_manifest"], cfg, stage="stage2", training=False)
+    train_ds = dataset_cls(cfg["data"]["train_manifest"], cfg, training=True)
+    val_ds = dataset_cls(cfg["data"]["val_manifest"], cfg, training=False)
     test1_ds = None
     if args.test1_manifest is not None:
-        if using_mimi_features:
-            test1_ds = dataset_cls(str(args.test1_manifest), cfg, training=False)
-        else:
-            test1_ds = dataset_cls(str(args.test1_manifest), cfg, stage="stage2", training=False)
+        test1_ds = dataset_cls(str(args.test1_manifest), cfg, training=False)
     train_loader = DataLoader(
         train_ds,
         batch_size=int(cfg["data"]["train_batch_size"]),

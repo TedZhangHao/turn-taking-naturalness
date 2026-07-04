@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from dualturn.utils import read_csv, save_csv
+from turnnat.utils import read_csv, save_csv
 
 
 MANIFEST_FIELDS = [

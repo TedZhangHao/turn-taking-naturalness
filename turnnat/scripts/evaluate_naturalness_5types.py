@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_DATASET = Path("dataset/turn_taking_naturalness_5types_200")
-DEFAULT_OUTPUT = Path("dualturn/outputs/vap_nll_naturalness_5types_200")
+DEFAULT_OUTPUT = Path("turnnat/outputs/vap_nll_naturalness_5types_200")
 DEFAULT_CHECKPOINT = Path("VAP-main/example/checkpoints/VAP_state_dict.pt")
 TYPE_ORDER = [
     "early_entry",
@@ -212,7 +212,7 @@ def main() -> None:
     parser.add_argument("--expected-types", default=",".join(TYPE_ORDER))
     args = parser.parse_args()
 
-    manifest = args.manifest or args.dataset_root / "manifests/test2.csv"
+    manifest = args.manifest or args.dataset_root / "manifests/test.csv"
     if not manifest.is_file():
         raise FileNotFoundError(manifest)
     if args.skip_scoring:

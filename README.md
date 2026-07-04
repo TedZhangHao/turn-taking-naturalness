@@ -30,18 +30,28 @@ pip install -r requirements-train.txt
 pip install -e VAP-main
 ```
 
-Place a raw VAP model state dict from the upstream VAP repository at
-`checkpoints/VAP_state_dict.pt` if you want to run VAP scoring or VAP training.
-DualTurn checkpoints/backbones are loaded through Hugging Face unless you pass
-local/offline paths.
-
 Checkpoint and data locations:
 
 - Turn-Taking Naturalness benchmark dataset: Hugging Face dataset link coming soon.
-- Released FVAD checkpoints for this repository: Hugging Face model link coming soon.
+- Released TurnNat FVAD checkpoint: Hugging Face model link coming soon. Download
+  it to `checkpoints/turn_taking_naturalness_fvad.pt`, or pass the downloaded
+  path with `--checkpoint`.
 - Official DualTurn backbone/checkpoint: [`anyreach-ai/dualturn-qwen2.5-mimi-0.5B`](https://huggingface.co/anyreach-ai/dualturn-qwen2.5-mimi-0.5B).
-- Official VAP code/checkpoint example: [`ErikEkstedt/VAP`](https://github.com/ErikEkstedt/VAP); the upstream
-  repository includes a raw VAP state dict under `example/`.
+  The DualTurn scripts load this model from Hugging Face by default. For offline
+  runs, pre-cache it with Hugging Face/Transformers and use `--local-files-only`.
+- Official VAP code/checkpoint example: [`ErikEkstedt/VAP`](https://github.com/ErikEkstedt/VAP).
+  The VAP scorer/trainer expects the raw state dict at
+  `VAP-main/example/checkpoints/VAP_state_dict.pt`. Download it with:
+
+```bash
+mkdir -p VAP-main/example/checkpoints
+curl -L \
+  https://github.com/ErikEkstedt/VAP/raw/main/example/checkpoints/VAP_state_dict.pt \
+  -o VAP-main/example/checkpoints/VAP_state_dict.pt
+```
+
+You can also pass a different VAP state-dict path with `--checkpoint` or
+`--vap-ckpt`.
 
 ## Data Preparation
 
@@ -63,7 +73,7 @@ transcript/metadata paths when available.
 Generate all five perturbation types:
 
 ```bash
-python natural_classification/build_natural_unnatural_dualturn.py make-unnatural \
+python turnnat/scripts/build_perturbations.py make-unnatural \
   --natural-csv data/manifests/test_natural.csv \
   --out-root data/generated \
   --split test \
@@ -117,7 +127,7 @@ Useful generation variants:
 
 ```bash
 # One perturbation type only
-python natural_classification/build_natural_unnatural_dualturn.py make-unnatural \
+python turnnat/scripts/build_perturbations.py make-unnatural \
   --natural-csv data/manifests/test_natural.csv \
   --out-root data/generated_late \
   --split test \
@@ -126,7 +136,7 @@ python natural_classification/build_natural_unnatural_dualturn.py make-unnatural
   --short-context
 
 # Three inserted backchannels instead of the default two
-python natural_classification/build_natural_unnatural_dualturn.py make-unnatural \
+python turnnat/scripts/build_perturbations.py make-unnatural \
   --natural-csv data/manifests/test_natural.csv \
   --out-root data/generated_bc3 \
   --split test \
@@ -136,7 +146,7 @@ python natural_classification/build_natural_unnatural_dualturn.py make-unnatural
   --short-context
 
 # Sharded generation; give each worker a separate output directory
-python natural_classification/build_natural_unnatural_dualturn.py make-unnatural \
+python turnnat/scripts/build_perturbations.py make-unnatural \
   --natural-csv data/manifests/test_natural.csv \
   --out-root data/generated_late_shard00 \
   --split test \
@@ -149,14 +159,14 @@ python natural_classification/build_natural_unnatural_dualturn.py make-unnatural
 
 ## Try Your Own Audio
 
-`dualturn/scripts/try_audio.py` is a lightweight entry point for quick demos. It
+`turnnat/scripts/try_audio.py` is a lightweight entry point for quick demos. It
 expects two-channel audio where channel 0 and channel 1 are the two speakers.
 Mono files are duplicated to two channels, but stereo audio is recommended.
 
 Score one input recording directly with the official DualTurn FVAD head:
 
 ```bash
-python dualturn/scripts/try_audio.py score \
+python turnnat/scripts/try_audio.py score \
   --audio path/to/conversation.wav \
   --score-backend official-dualturn \
   --output-dir outputs/try_audio_dualturn
@@ -165,7 +175,7 @@ python dualturn/scripts/try_audio.py score \
 Score one recording with a released FVAD checkpoint downloaded from Hugging Face:
 
 ```bash
-python dualturn/scripts/try_audio.py score \
+python turnnat/scripts/try_audio.py score \
   --audio path/to/conversation.wav \
   --score-backend fvad-checkpoint \
   --checkpoint checkpoints/turn_taking_naturalness_fvad.pt \
@@ -177,11 +187,11 @@ Compare a natural/perturbed pair. Positive `delta_nll` means the perturbed file
 has higher DialogNLL than the natural reference under the selected model:
 
 ```bash
-python dualturn/scripts/try_audio.py score-pair \
+python turnnat/scripts/try_audio.py score-pair \
   --natural-audio path/to/natural.wav \
   --perturbed-audio path/to/perturbed.wav \
   --score-backend official-vap \
-  --checkpoint checkpoints/VAP_state_dict.pt \
+  --checkpoint VAP-main/example/checkpoints/VAP_state_dict.pt \
   --perturbation-type late_response \
   --output-dir outputs/try_audio_pair_vap
 ```
@@ -192,7 +202,7 @@ candidates and produce cleaner timing perturbations. The same script can run one
 generation pass and immediately score the generated pairs:
 
 ```bash
-python dualturn/scripts/try_audio.py perturb-and-score \
+python turnnat/scripts/try_audio.py perturb-and-score \
   --natural-csv data/manifests/test_natural.csv \
   --perturbation-type late_response \
   --per-type 1 \
@@ -214,17 +224,22 @@ Create `data/manifests/train.csv`, `dev.csv`, and `test.csv` using the format in
 train/validation loss and frame accuracy. `best.pt` is selected by validation
 loss.
 
+The training label path is shared across backbones: load two-channel audio,
+build per-channel 50 Hz Silero VAD labels, then adapt that same VAD stream to
+VAP 256-state targets or DualTurn native/all-six targets. The chunk dataset only
+loads audio and frame masks; it does not derive RMS VAD or turn-action labels.
+
 For DualTurn all-six training, first cache VAD and signal labels:
 
 ```bash
-python dualturn/scripts/build_silero_vad_cache.py \
+python turnnat/scripts/build_silero_vad_cache.py \
   --manifest data/manifests/train.csv --output-dir data/cache/vad
-python dualturn/scripts/build_silero_vad_cache.py \
+python turnnat/scripts/build_silero_vad_cache.py \
   --manifest data/manifests/dev.csv --output-dir data/cache/vad --skip-existing
-python dualturn/scripts/build_silero_vad_cache.py \
+python turnnat/scripts/build_silero_vad_cache.py \
   --manifest data/manifests/test.csv --output-dir data/cache/vad --skip-existing
 
-python dualturn/scripts/build_dualturn_signal_cache.py \
+python turnnat/scripts/build_dualturn_signal_cache.py \
   --manifest data/manifests/train.csv \
   --manifest data/manifests/dev.csv \
   --manifest data/manifests/test.csv \
@@ -234,9 +249,9 @@ python dualturn/scripts/build_dualturn_signal_cache.py \
 Run an experiment:
 
 ```bash
-python dualturn/scripts/run_fvad_experiment.py configs/train_vap_full.yaml
-python dualturn/scripts/run_fvad_experiment.py configs/train_dualturn_native_all6.yaml
-python dualturn/scripts/run_fvad_experiment.py configs/train_dualturn_fvad256_all6.yaml
+python turnnat/scripts/run_fvad_experiment.py configs/train_vap_full.yaml
+python turnnat/scripts/run_fvad_experiment.py configs/train_dualturn_native_all6.yaml
+python turnnat/scripts/run_fvad_experiment.py configs/train_dualturn_fvad256_all6.yaml
 ```
 
 Training checkpoints are written to `outputs/<experiment>/checkpoints/` as
@@ -247,7 +262,7 @@ Training checkpoints are written to `outputs/<experiment>/checkpoints/` as
 Score a trained FVAD checkpoint on a paired natural/perturbed manifest:
 
 ```bash
-python dualturn/scripts/score_fvad_checkpoint.py \
+python turnnat/scripts/score_fvad_checkpoint.py \
   --checkpoint outputs/dualturn_fvad256_all6/checkpoints/best.pt \
   --experiment auto \
   --manifest data/generated/manifests/test.csv \
@@ -260,15 +275,15 @@ For a shared/released checkpoint, download it separately and pass its path with
 `--checkpoint`. You can list supported profile names with:
 
 ```bash
-python dualturn/scripts/score_fvad_checkpoint.py --list-experiments
+python turnnat/scripts/score_fvad_checkpoint.py --list-experiments
 ```
 
 Score an upstream VAP checkpoint directly:
 
 ```bash
-python dualturn/scripts/score_vap_nll_naturalness.py \
+python turnnat/scripts/score_vap_nll_naturalness.py \
   --unnatural-manifest data/generated/manifests/test.csv \
-  --checkpoint checkpoints/VAP_state_dict.pt \
+  --checkpoint VAP-main/example/checkpoints/VAP_state_dict.pt \
   --output-dir outputs/eval_vap \
   --device cuda
 ```
@@ -283,6 +298,7 @@ utterance units, and reports:
 | `MeanNLL` | Mean NLL over all utterance units | Lower for a natural recording |
 | `TailNLL` | Mean of the worst 25% unit NLL values | Lower |
 | `DialogNLL` | `0.5 * MeanNLL + 0.5 * TailNLL` | Lower |
+| `NatScore` / `nat_score` | Dialogue-level turn-taking naturalness score, defined as `-DialogNLL` | Higher |
 | `DeltaNLL` | `perturbed DialogNLL - natural DialogNLL` | Positive/larger |
 | `Pairwise Accuracy` | Fraction of matched pairs with `DeltaNLL > 0` | Higher |
 | `C-index` | Fraction of all perturbed-vs-natural dialogue-NLL comparisons correctly ordered; ties excluded | Higher |
@@ -292,7 +308,7 @@ Output is written under `OUTPUT_DIR/step_<global_step>/`:
 
 - `metrics.json` and `metrics.csv`: aggregate metrics with variance and 95% CI
 - `pair_scores.csv`: natural/perturbed scores and `DeltaNLL` for each pair
-- `segment_scores.csv`: recording-level `MeanNLL`, `TailNLL`, and `DialogNLL`
+- `segment_scores.csv`: recording-level `MeanNLL`, `TailNLL`, `DialogNLL`, and `nat_score`
 - `units.csv`: utterance-boundary unit NLL values
 - `inference_config.json`: resolved experiment profile and checkpoint metadata
 
@@ -307,9 +323,9 @@ These metrics are for standalone evaluation and reporting.
 Score the sample pairs with VAP:
 
 ```bash
-python dualturn/scripts/score_vap_nll_naturalness.py \
+python turnnat/scripts/score_vap_nll_naturalness.py \
   --unnatural-manifest samples/manifest.csv \
-  --checkpoint checkpoints/VAP_state_dict.pt \
+  --checkpoint VAP-main/example/checkpoints/VAP_state_dict.pt \
   --output-dir outputs/sample_vap \
   --device cuda
 ```
@@ -317,7 +333,7 @@ python dualturn/scripts/score_vap_nll_naturalness.py \
 Score the official DualTurn native 8-bit head:
 
 ```bash
-python dualturn/scripts/score_dualturn_fvad_nll_naturalness.py \
+python turnnat/scripts/score_dualturn_fvad_nll_naturalness.py \
   --unnatural-manifest samples/manifest.csv \
   --output-dir outputs/sample_dualturn \
   --device cuda
