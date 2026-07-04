@@ -1,13 +1,19 @@
 # Turn-Taking Naturalness
 
 Minimal code for generating five conversational timing perturbations, training
-FVAD models, and scoring paired natural/edited conversations with NLL.
+FVAD models, and scoring paired natural/perturbed conversations with NLL.
 
-The public pipeline keeps generation and model evaluation separate. Generated
-samples are produced from data-only timing and VAD rules; checkpoint evaluation
-is run as a standalone post-training step.
+The public pipeline keeps perturbation generation and model evaluation separate.
+Perturbed samples are produced from data-only timing and VAD rules; checkpoint
+evaluation is run as a standalone post-training step.
 
 ## Setup
+
+There are two requirements files because data generation and model training have
+very different dependency footprints:
+
+- `requirements.txt`: lightweight dependencies for perturbation generation.
+- `requirements-train.txt`: optional model stack for FVAD training and checkpoint evaluation.
 
 For data generation only:
 
@@ -17,7 +23,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-For model training or checkpoint evaluation, install the optional model stack:
+For model training or checkpoint evaluation:
 
 ```bash
 pip install -r requirements-train.txt
@@ -29,19 +35,38 @@ Place a raw VAP model state dict from the upstream VAP repository at
 DualTurn checkpoints/backbones are loaded through Hugging Face unless you pass
 local/offline paths.
 
-## Generate Edited Data
+Checkpoint and data locations:
 
-Prepare a natural-conversation manifest using the format in
-`data/manifests/README.md`. Each row should point to the two participant audio
-files, and transcript/metadata paths if available.
+- Turn-Taking Naturalness benchmark dataset: Hugging Face dataset link coming soon.
+- Released FVAD checkpoints for this repository: Hugging Face model link coming soon.
+- Official DualTurn backbone/checkpoint: [`anyreach-ai/dualturn-qwen2.5-mimi-0.5B`](https://huggingface.co/anyreach-ai/dualturn-qwen2.5-mimi-0.5B).
+- Official VAP code/checkpoint example: [`ErikEkstedt/VAP`](https://github.com/ErikEkstedt/VAP); the upstream
+  repository includes a raw VAP state dict under `example/`.
+
+## Data Preparation
+
+The benchmark perturbation dataset and released model checkpoints will be hosted
+on Hugging Face. If you use the released data, point the training and evaluation
+commands below to the downloaded manifests.
+
+To generate perturbations from your own conversations, prepare CSV manifests in
+the format described in `data/manifests/README.md`:
+
+- `train.csv`, `dev.csv`, and `test.csv` for FVAD training/evaluation.
+- `test_natural.csv` for perturbation generation from natural conversations.
+
+Each natural-conversation row should point to the two participant audio files and
+transcript/metadata paths when available.
+
+## Generate Perturbed Data
 
 Generate all five perturbation types:
 
 ```bash
 python natural_classification/build_natural_unnatural_dualturn.py make-unnatural \
-  --natural-csv data/manifests/test2_natural.csv \
+  --natural-csv data/manifests/test_natural.csv \
   --out-root data/generated \
-  --split test2 \
+  --split test \
   --per-type 200 \
   --types early_entry,late_response,shift_instead_of_hold,hold_instead_of_shift,excessive_backchannel \
   --short-context
@@ -49,22 +74,26 @@ python natural_classification/build_natural_unnatural_dualturn.py make-unnatural
 
 Outputs are written under `data/generated/`:
 
-- `manifests/test2.csv`: paired natural/edited manifest
-- `test2/audio/`: edited audio
-- `test2/json/`: edited metadata, including `edit_meta`
-- `test2/natural_audio/` and `test2/natural_json/`: matched natural references
-- `generated_test2_rows.csv`, `test2_generation_log.csv`, and `test2_failures.csv`:
+- `manifests/test.csv`: paired natural/perturbed manifest
+- `test/audio/`: perturbed audio
+- `test/json/`: perturbation metadata (`edit_meta` in JSON for compatibility)
+- `test/natural_audio/` and `test/natural_json/`: matched natural references
+- `generated_test_rows.csv`, `test_generation_log.csv`, and `test_failures.csv`:
   generation bookkeeping and failure reasons
 
-### Default Generation Logic
+### Default Perturbation Logic
 
 Common defaults:
 
 - turn source: `silero`
-- one edit per generated clip
+- one perturbation per generated clip
 - short-context crop target: `20-25s`
-- crop guard keeps the edited boundary and nearby turn-taking context inside the crop
+- crop guard keeps the perturbed boundary and nearby turn-taking context inside the crop
 - generated WAVs are normalized to `-20 dBFS` RMS and `-1 dBFS` peak
+- splice boundaries use short fades/crossfades where audio is shifted, inserted,
+  or removed
+- inserted silence and removed speech regions are filled with nearby room tone
+  where synthetic background is needed
 
 Per-type defaults:
 
@@ -89,18 +118,18 @@ Useful generation variants:
 ```bash
 # One perturbation type only
 python natural_classification/build_natural_unnatural_dualturn.py make-unnatural \
-  --natural-csv data/manifests/test2_natural.csv \
+  --natural-csv data/manifests/test_natural.csv \
   --out-root data/generated_late \
-  --split test2_late \
+  --split test \
   --per-type 200 \
   --types late_response \
   --short-context
 
 # Three inserted backchannels instead of the default two
 python natural_classification/build_natural_unnatural_dualturn.py make-unnatural \
-  --natural-csv data/manifests/test2_natural.csv \
+  --natural-csv data/manifests/test_natural.csv \
   --out-root data/generated_bc3 \
-  --split test2_bc3 \
+  --split test \
   --per-type 100 \
   --types excessive_backchannel \
   --bc-insert-count 3 \
@@ -108,9 +137,9 @@ python natural_classification/build_natural_unnatural_dualturn.py make-unnatural
 
 # Sharded generation; give each worker a separate output directory
 python natural_classification/build_natural_unnatural_dualturn.py make-unnatural \
-  --natural-csv data/manifests/test2_natural.csv \
+  --natural-csv data/manifests/test_natural.csv \
   --out-root data/generated_late_shard00 \
-  --split test2 \
+  --split test \
   --per-type 200 \
   --types late_response \
   --num-shards 16 \
@@ -118,9 +147,69 @@ python natural_classification/build_natural_unnatural_dualturn.py make-unnatural
   --short-context
 ```
 
+## Try Your Own Audio
+
+`dualturn/scripts/try_audio.py` is a lightweight entry point for quick demos. It
+expects two-channel audio where channel 0 and channel 1 are the two speakers.
+Mono files are duplicated to two channels, but stereo audio is recommended.
+
+Score one input recording directly with the official DualTurn FVAD head:
+
+```bash
+python dualturn/scripts/try_audio.py score \
+  --audio path/to/conversation.wav \
+  --score-backend official-dualturn \
+  --output-dir outputs/try_audio_dualturn
+```
+
+Score one recording with a released FVAD checkpoint downloaded from Hugging Face:
+
+```bash
+python dualturn/scripts/try_audio.py score \
+  --audio path/to/conversation.wav \
+  --score-backend fvad-checkpoint \
+  --checkpoint checkpoints/turn_taking_naturalness_fvad.pt \
+  --experiment auto \
+  --output-dir outputs/try_audio_fvad
+```
+
+Compare a natural/perturbed pair. Positive `delta_nll` means the perturbed file
+has higher DialogNLL than the natural reference under the selected model:
+
+```bash
+python dualturn/scripts/try_audio.py score-pair \
+  --natural-audio path/to/natural.wav \
+  --perturbed-audio path/to/perturbed.wav \
+  --score-backend official-vap \
+  --checkpoint checkpoints/VAP_state_dict.pt \
+  --perturbation-type late_response \
+  --output-dir outputs/try_audio_pair_vap
+```
+
+For high-quality perturbation generation, use a natural manifest rather than a
+standalone wav. Transcript/metadata sidecars let the generator avoid weak
+candidates and produce cleaner timing perturbations. The same script can run one
+generation pass and immediately score the generated pairs:
+
+```bash
+python dualturn/scripts/try_audio.py perturb-and-score \
+  --natural-csv data/manifests/test_natural.csv \
+  --perturbation-type late_response \
+  --per-type 1 \
+  --score-backend fvad-checkpoint \
+  --checkpoint checkpoints/turn_taking_naturalness_fvad.pt \
+  --experiment auto \
+  --output-dir outputs/try_late_response
+```
+
+Outputs include `metrics.json`, `segment_scores.csv`, `units.csv`, and, for
+pairs, `pair_scores.csv`. Use `--score-backend official-dualturn`,
+`official-vap`, or `fvad-checkpoint` depending on which checkpoint you want to
+try.
+
 ## Train FVAD Models
 
-Create `data/manifests/train.csv`, `dev.csv`, and `test1.csv` using the format in
+Create `data/manifests/train.csv`, `dev.csv`, and `test.csv` using the format in
 `data/manifests/README.md`. The included configs train with standard FVAD
 train/validation loss and frame accuracy. `best.pt` is selected by validation
 loss.
@@ -133,12 +222,12 @@ python dualturn/scripts/build_silero_vad_cache.py \
 python dualturn/scripts/build_silero_vad_cache.py \
   --manifest data/manifests/dev.csv --output-dir data/cache/vad --skip-existing
 python dualturn/scripts/build_silero_vad_cache.py \
-  --manifest data/manifests/test1.csv --output-dir data/cache/vad --skip-existing
+  --manifest data/manifests/test.csv --output-dir data/cache/vad --skip-existing
 
 python dualturn/scripts/build_dualturn_signal_cache.py \
   --manifest data/manifests/train.csv \
   --manifest data/manifests/dev.csv \
-  --manifest data/manifests/test1.csv \
+  --manifest data/manifests/test.csv \
   --vad-cache-dir data/cache/vad --output-dir data/cache/signals
 ```
 
@@ -155,13 +244,13 @@ Training checkpoints are written to `outputs/<experiment>/checkpoints/` as
 
 ## Evaluate Checkpoints
 
-Score a trained FVAD checkpoint on a paired natural/edited manifest:
+Score a trained FVAD checkpoint on a paired natural/perturbed manifest:
 
 ```bash
 python dualturn/scripts/score_fvad_checkpoint.py \
   --checkpoint outputs/dualturn_fvad256_all6/checkpoints/best.pt \
   --experiment auto \
-  --manifest data/generated/manifests/test2.csv \
+  --manifest data/generated/manifests/test.csv \
   --output-dir outputs/eval_dualturn_fvad256 \
   --device cuda \
   --batch-size 4
@@ -178,7 +267,7 @@ Score an upstream VAP checkpoint directly:
 
 ```bash
 python dualturn/scripts/score_vap_nll_naturalness.py \
-  --unnatural-manifest data/generated/manifests/test2.csv \
+  --unnatural-manifest data/generated/manifests/test.csv \
   --checkpoint checkpoints/VAP_state_dict.pt \
   --output-dir outputs/eval_vap \
   --device cuda
@@ -194,15 +283,15 @@ utterance units, and reports:
 | `MeanNLL` | Mean NLL over all utterance units | Lower for a natural recording |
 | `TailNLL` | Mean of the worst 25% unit NLL values | Lower |
 | `DialogNLL` | `0.5 * MeanNLL + 0.5 * TailNLL` | Lower |
-| `DeltaNLL` | `edited DialogNLL - natural DialogNLL` | Positive/larger |
+| `DeltaNLL` | `perturbed DialogNLL - natural DialogNLL` | Positive/larger |
 | `Pairwise Accuracy` | Fraction of matched pairs with `DeltaNLL > 0` | Higher |
-| `C-index` | Fraction of all edited-vs-natural dialogue-NLL comparisons correctly ordered; ties excluded | Higher |
+| `C-index` | Fraction of all perturbed-vs-natural dialogue-NLL comparisons correctly ordered; ties excluded | Higher |
 
-Results are reported overall and separately for all five edit types. Output is
-written under `OUTPUT_DIR/step_<global_step>/`:
+Results are reported overall and separately for all five perturbation types.
+Output is written under `OUTPUT_DIR/step_<global_step>/`:
 
 - `metrics.json` and `metrics.csv`: aggregate metrics with variance and 95% CI
-- `pair_scores.csv`: natural/edited scores and `DeltaNLL` for each pair
+- `pair_scores.csv`: natural/perturbed scores and `DeltaNLL` for each pair
 - `segment_scores.csv`: recording-level `MeanNLL`, `TailNLL`, and `DialogNLL`
 - `units.csv`: utterance-boundary unit NLL values
 - `inference_config.json`: resolved experiment profile and checkpoint metadata
@@ -211,7 +300,7 @@ These metrics are for standalone evaluation and reporting.
 
 ## Samples
 
-`samples/manifest.csv` contains one natural/edited pair for each type:
+`samples/manifest.csv` contains one natural/perturbed pair for each type:
 `early_entry`, `late_response`, `shift_instead_of_hold`,
 `hold_instead_of_shift`, and `excessive_backchannel`.
 
@@ -234,5 +323,4 @@ python dualturn/scripts/score_dualturn_fvad_nll_naturalness.py \
   --device cuda
 ```
 
-Large datasets, caches, model weights, and generated outputs are excluded by
-`.gitignore`.
+Benchmark dataset and model checkpoints will be released on Hugging Face.

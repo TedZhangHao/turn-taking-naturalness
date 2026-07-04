@@ -1,10 +1,24 @@
 {
-  "session_id": "naturalistic_V00_S65_I00000125_P0097_P0098__late_response__k1__natural",
-  "duration": 23.374395833333335,
+  "session_id": "naturalistic_V02_S3310_I00000138_P4157_P4160__late_response__k1__natural",
+  "duration": 23.3185,
   "language": "en",
   "session_type": "dyadic",
+  "source_crop_start_ms": 129911.5,
+  "source_crop_end_ms": 153230.0,
+  "paired_unnatural_stem": "naturalistic_V02_S3310_I00000138_P4157_P4160__late_response__k1",
+  "audio_normalization": {
+    "enabled": true,
+    "target_rms_dbfs": -20.0,
+    "peak_dbfs": -1.0,
+    "gain": 4.773539,
+    "gain_db": 13.577,
+    "input_rms_dbfs": -38.672,
+    "input_peak_dbfs": -14.577
+  },
   "augmentation_type": "natural_reference",
-  "source_natural_stem": "naturalistic_V00_S65_I00000125_P0097_P0098",
+  "participant1_id": "P4157",
+  "participant2_id": "P4160",
+  "source_natural_stem": "naturalistic_V02_S3310_I00000138_P4157_P4160",
   "turn_source": "silero",
   "vad_config": {
     "threshold": 0.5,
@@ -12,5 +26,7 @@
     "min_silence_ms": 120.0,
     "speech_pad_ms": 40.0,
     "merge_gap_ms": 180.0
-  }
+  },
+  "split": "sample",
+  "perturbation_type": "natural_reference"
 }

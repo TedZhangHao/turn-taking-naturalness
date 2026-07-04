@@ -10,7 +10,7 @@ precision:
 data:
   train_manifest: data/manifests/train.csv
   val_manifest: data/manifests/dev.csv
-  test1_manifest: data/manifests/test1.csv
+  test1_manifest: data/manifests/test.csv
   target_sample_rate: 24000
   samples_per_frame: 1920
   frame_hz: 12.5

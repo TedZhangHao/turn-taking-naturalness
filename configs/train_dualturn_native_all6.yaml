@@ -11,7 +11,7 @@ arguments:
   output_dir: outputs/dualturn_native_all6
   train_manifest: data/manifests/train.csv
   val_manifest: data/manifests/dev.csv
-  test1_manifest: data/manifests/test1.csv
+  test1_manifest: data/manifests/test.csv
   epochs: 5
   lr: 5.0e-6
   backbone_lr: 1.0e-6

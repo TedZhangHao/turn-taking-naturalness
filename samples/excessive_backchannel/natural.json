@@ -1,10 +1,24 @@
 {
-  "session_id": "naturalistic_V00_S515_I00000371_P0371_P0660__excessive_backchannel__k1__natural",
-  "duration": 24.95,
+  "session_id": "naturalistic_V03_S1665_I00000082_P4761_P4779__excessive_backchannel__bc3__k1__natural",
+  "duration": 24.23,
   "language": "en",
   "session_type": "dyadic",
+  "source_crop_start_ms": 23720.0,
+  "source_crop_end_ms": 47950.0,
+  "paired_unnatural_stem": "naturalistic_V03_S1665_I00000082_P4761_P4779__excessive_backchannel__bc3__k1",
+  "audio_normalization": {
+    "enabled": true,
+    "target_rms_dbfs": -20.0,
+    "peak_dbfs": -1.0,
+    "gain": 1.964517,
+    "gain_db": 5.865,
+    "input_rms_dbfs": -29.409,
+    "input_peak_dbfs": -6.865
+  },
   "augmentation_type": "natural_reference",
-  "source_natural_stem": "naturalistic_V00_S515_I00000371_P0371_P0660",
+  "participant1_id": "P4761",
+  "participant2_id": "P4779",
+  "source_natural_stem": "naturalistic_V03_S1665_I00000082_P4761_P4779",
   "turn_source": "silero",
   "vad_config": {
     "threshold": 0.5,
@@ -12,5 +26,7 @@
     "min_silence_ms": 120.0,
     "speech_pad_ms": 40.0,
     "merge_gap_ms": 180.0
-  }
+  },
+  "split": "sample",
+  "perturbation_type": "natural_reference"
 }

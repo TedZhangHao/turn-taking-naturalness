@@ -16,3 +16,6 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+# Keep the small checked-in sample pairs.
+!samples/
+!samples/**
