@@ -1,0 +1,168 @@
+{
+  "backbone": "dualturn",
+  "backbone_lr": 1e-06,
+  "clean_min_silence_ms": 150,
+  "clean_min_speech_ms": 150,
+  "config": {
+    "data": {
+      "all_manifest": "${OTOSPEECH_ROOT}/manifests/all_sessions.csv",
+      "channels": 2,
+      "chunk_seconds": 12.0,
+      "eval_batch_size": 4,
+      "eval_chunk_seconds": 12.0,
+      "frame_hz": 12.5,
+      "input_mode": "tar",
+      "num_workers": 8,
+      "pin_memory": true,
+      "samples_per_frame": 1920,
+      "target_sample_rate": 24000,
+      "test1_manifest": "dataset/naturalistic_300h_speaker_disjoint_mimi_ok_ipc_conversation/test1.csv",
+      "test_manifest": "${OTOSPEECH_ROOT}/manifests/test.csv",
+      "train_batch_size": 4,
+      "train_manifest": "dataset/naturalistic_300h_speaker_disjoint_mimi_ok_ipc_conversation/train.csv",
+      "vad": {
+        "rms_threshold": 0.015
+      },
+      "val_manifest": "dataset/naturalistic_300h_speaker_disjoint_mimi_ok_ipc_conversation/dev.csv"
+    },
+    "logging": {
+      "flush_secs": 30,
+      "tensorboard_subdir": "tensorboard",
+      "use_tensorboard": true
+    },
+    "model": {
+      "channel_mlp_hidden": 512,
+      "channel_proj_dim": 448,
+      "continuous_feature_dim": 512,
+      "head_dropout": 0.1,
+      "lora_alpha": 32,
+      "lora_dropout": 0.05,
+      "lora_r": 16,
+      "mimi_name": "kyutai/mimi",
+      "num_quantizers": 8,
+      "qwen_dtype": "bf16",
+      "qwen_name": "Qwen/Qwen2.5-0.5B",
+      "use_lora": true
+    },
+    "paths": {
+      "extracted_root": "${OTOSPEECH_ROOT}/extracted_train",
+      "manifest_dir": "${OTOSPEECH_ROOT}/manifests",
+      "output_dir": "dualturn/outputs/eventwt8_minutt02_dualturn_full_all6_fvad256",
+      "tar_root": "${OTOSPEECH_ROOT}/data/train"
+    },
+    "precision": {
+      "matmul_precision": "high",
+      "mode": "bf16"
+    },
+    "probe": {
+      "class_weight": "balanced",
+      "max_iter": 1000
+    },
+    "seed": 42,
+    "stage1": {
+      "early_stop_patience": 2,
+      "epochs": 8,
+      "evals_per_epoch": 1,
+      "full_finetune_after_epoch": 10,
+      "grad_clip": 1.0,
+      "log_every": 20,
+      "lr_full_ft": 1e-05,
+      "lr_lora": 0.0003,
+      "scheduler_factor": 0.5,
+      "scheduler_patience": 2,
+      "weight_decay": 0.01
+    },
+    "stage2": {
+      "early_stop_patience": 2,
+      "epochs": 10,
+      "evals_per_epoch": 1,
+      "focal_alpha": 0.25,
+      "focal_gamma": 2.0,
+      "grad_clip": 1.0,
+      "log_every": 20,
+      "lr": 0.0001,
+      "scheduler_factor": 0.5,
+      "scheduler_patience": 1,
+      "weight_decay": 0.01
+    }
+  },
+  "context_seconds": 0.0,
+  "dualturn_fvad_head": "categorical256",
+  "dualturn_lora": {
+    "alpha": 32,
+    "dropout": 0.05,
+    "r": 16,
+    "targets": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ]
+  },
+  "dualturn_losses": "all",
+  "dualturn_model_id": "anyreach-ai/dualturn-qwen2.5-mimi-0.5B",
+  "eval_every_steps": 1500,
+  "event_weight_alpha": 8.0,
+  "event_weight_min_utterance_s": 0.2,
+  "event_weight_unit_mode": "boundaries",
+  "event_weight_unit_post_s": 0.0,
+  "event_weight_unit_pre_s": 2.0,
+  "event_weight_utterance_merge_gap_s": 1.0,
+  "event_weight_utterance_merge_other_max_ratio": 0.2,
+  "frame_hz": 12.5,
+  "fvad_head_lr": 0.0001,
+  "fvad_target_scheme": "shared-binary",
+  "head_init": "random",
+  "label_definition": "shared-binary uses the common 50Hz VAP windows and eight thresholded bits; native-soft downsamples the same 50Hz VAD to 12.5Hz and reproduces the official DualTurn [3,6,12,25] soft occupancy targets.",
+  "label_frame_hz": 50.0,
+  "local_files_only": true,
+  "lr": 5e-06,
+  "max_mid_eval_batches": 200,
+  "mimi_feature_root": "dualturn/data/seamless_naturalistic_300h_official/processed_npy",
+  "naturalness_batch_size": 2,
+  "naturalness_bernoulli_reduction": "sum",
+  "naturalness_checkpoint_metric": "c_index",
+  "naturalness_eval_at_start": true,
+  "naturalness_eval_every_steps": 1500,
+  "naturalness_limit": null,
+  "naturalness_manifest": "dataset/turn_taking_naturalness_5types/manifests/test2.csv",
+  "naturalness_output_dir": null,
+  "objective_type": "categorical256",
+  "signal_label_cache_dir": "dualturn/outputs/signal_cache/seamless_250h_silero_official",
+  "silero_min_silence_ms": 50,
+  "silero_min_speech_ms": 100,
+  "silero_threshold": 0.5,
+  "task_weights": {
+    "bc": 1.0,
+    "bot": 1.0,
+    "eot": 1.0,
+    "fvad": 0.125,
+    "hold": 1.0,
+    "vad": 1.0
+  },
+  "test1_manifest": "dataset/naturalistic_300h_speaker_disjoint_mimi_ok_ipc_conversation/test1.csv",
+  "threshold_ratio": 0.5,
+  "train_mode": "full",
+  "vad_cache_dir": "dualturn/outputs/vad_cache/seamless_300h_silero_ipc_conversation",
+  "vad_source": "silero",
+  "vap_bin_frames_50hz": [
+    10,
+    20,
+    30,
+    40
+  ],
+  "vap_bin_times": [
+    0.2,
+    0.4,
+    0.6,
+    0.8
+  ],
+  "vap_vad_loss_weight": 0.0,
+  "wandb_log_every": 20,
+  "wandb_mode": "online",
+  "wandb_project": "fvad-ipc-ablation",
+  "wandb_run_name": "eventwt8-minutt02-dualturn-full-all6-fvad256"
+}

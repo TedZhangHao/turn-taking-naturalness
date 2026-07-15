@@ -1,0 +1,41 @@
+base_config: configs/otospeech_dualturn.yaml
+environment:
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+arguments:
+  backbone: dualturn
+  train_mode: full
+  dualturn_fvad_head: categorical256
+  head_init: random
+  fvad_target_scheme: shared-binary
+  dualturn_losses: all
+  local_files_only: true
+  mimi_feature_root: dualturn/data/seamless_naturalistic_300h_official/processed_npy
+  signal_label_cache_dir: dualturn/outputs/signal_cache/seamless_250h_silero_official
+  output_dir: dualturn/outputs/turnnat_dualturn_fvad256
+  train_manifest: dataset/naturalistic_300h_speaker_disjoint_mimi_ok_ipc_conversation/train.csv
+  val_manifest: dataset/naturalistic_300h_speaker_disjoint_mimi_ok_ipc_conversation/dev.csv
+  test1_manifest: dataset/naturalistic_300h_speaker_disjoint_mimi_ok_ipc_conversation/test1.csv
+  vad_cache_dir: dualturn/outputs/vad_cache/seamless_300h_silero_ipc_conversation
+  epochs: 5
+  lr: 5.0e-6
+  fvad_head_lr: 1.0e-4
+  backbone_lr: 1.0e-6
+  train_batch_size: 4
+  eval_batch_size: 4
+  eval_every_steps: 1500
+  max_mid_eval_batches: 200
+  weight_fvad: 0.125
+  weight_vad: 1.0
+  weight_eot: 1.0
+  weight_hold: 1.0
+  weight_bot: 1.0
+  weight_bc: 1.0
+  naturalness_manifest: dataset/turn_taking_naturalness_5types_200_fixed_early_entry/manifests/test2.csv
+  naturalness_eval_at_start: true
+  naturalness_checkpoint_metric: c_index
+  naturalness_eval_every_steps: 1500
+  naturalness_batch_size: 2
+  naturalness_bernoulli_reduction: sum
+  wandb_project: fvad-ipc-ablation
+  wandb_run_name: turnnat-dualturn-fvad256

@@ -19,16 +19,14 @@ for path in (PROJECT_ROOT, SCRIPT_DIR, VAP_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from fvad_naturalness_eval import NaturalnessFiveTypeEvaluator  # noqa: E402
 from score_fvad_checkpoint import (  # noqa: E402
     DEFAULT_EXPERIMENT,
     EXPERIMENTS,
-    build_model,
+    load_model_and_metadata,
     load_training_checkpoint,
-    resolve_experiment,
     saved,
 )
-from train_fvad_head import DEFAULT_DUALTURN_MODEL_ID, vap_bin_times_to_frames  # noqa: E402
+from train_fvad_head import DEFAULT_DUALTURN_MODEL_ID, NaturalnessFiveTypeEvaluator, vap_bin_times_to_frames  # noqa: E402
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -160,16 +158,14 @@ def score_with_official_dualturn(model, audio_path: Path, *, segment_id: str, co
 def load_fvad_checkpoint(args: argparse.Namespace, device: torch.device) -> tuple[torch.nn.Module, dict[str, Any], Any]:
     if args.checkpoint is None:
         raise ValueError("--checkpoint is required with --score-backend fvad-checkpoint")
-    payload = load_training_checkpoint(args.checkpoint)
-    _, spec = resolve_experiment(payload, args.experiment)
-    model = build_model(payload, spec, local_files_only=args.local_files_only).to(device).eval()
-    return model, payload, spec
+    model, payload, backbone = load_model_and_metadata(args.checkpoint, local_files_only=args.local_files_only)
+    return model.to(device).eval(), payload, backbone
 
 
 def score_with_fvad_checkpoint(model_pack, audio_path: Path, *, segment_id: str, condition: str, args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
-    model, payload, spec = model_pack
-    frame_hz = 50.0 if spec.backbone == "vap" else 12.5
-    sample_rate = 16_000 if spec.backbone == "vap" else 24_000
+    model, payload, backbone = model_pack
+    frame_hz = 50.0 if backbone == "vap" else 12.5
+    sample_rate = 16_000 if backbone == "vap" else 24_000
     dummy_manifest = PROJECT_ROOT / "samples" / "manifest.csv"
     evaluator = NaturalnessFiveTypeEvaluator(
         manifest=dummy_manifest,
@@ -358,7 +354,7 @@ def add_score_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--score-backend", choices=["official-dualturn", "official-vap", "fvad-checkpoint"], default="official-dualturn")
     parser.add_argument("--checkpoint", type=Path, default=None, help="VAP state dict or released FVAD checkpoint path, depending on --score-backend.")
     parser.add_argument("--experiment", choices=[*EXPERIMENTS, "auto"], default="auto", help="FVAD checkpoint profile; use auto for released checkpoints with metadata.")
-    parser.add_argument("--batch-size", type=int, default=4, help="Pair batch size used by perturb-and-score with --score-backend fvad-checkpoint.")
+    parser.add_argument("--batch-size", type=int, default=16, help="Pair batch size used by perturb-and-score with --score-backend fvad-checkpoint.")
     parser.add_argument("--model-id", default=DEFAULT_DUALTURN_MODEL_ID, help="Hugging Face model id for official DualTurn scoring.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--local-files-only", action=argparse.BooleanOptionalAction, default=False)

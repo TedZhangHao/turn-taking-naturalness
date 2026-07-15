@@ -25,13 +25,12 @@ for path in [PROJECT_ROOT, VAP_ROOT]:
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from turnnat.config import ensure_output_dirs, load_config
-from turnnat.data.dataset import StereoChunkDataset, collate_chunks
-from turnnat.utils import count_trainable_parameters, save_json, set_seed
+from dualturn.config import ensure_output_dirs, load_config
+from dualturn.data.dataset import OtoSpeechChunkDataset, collate_chunks
+from dualturn.utils import count_trainable_parameters, save_json, set_seed
 
 
 DEFAULT_VAP_CKPT = PROJECT_ROOT / "VAP-main" / "example" / "checkpoints" / "VAP_state_dict.pt"
-VAP_STATE_DICT_URL = "https://github.com/ErikEkstedt/VAP/raw/main/example/checkpoints/VAP_state_dict.pt"
 DEFAULT_DUALTURN_MODEL_ID = "anyreach-ai/dualturn-qwen2.5-mimi-0.5B"
 DEFAULT_VAP_BIN_TIMES = [0.2, 0.4, 0.6, 0.8]
 IGNORE_INDEX = -100
@@ -74,11 +73,7 @@ class VAP256Model(nn.Module):
         if ckpt is not None:
             ckpt_path = Path(ckpt)
             if not ckpt_path.exists():
-                raise FileNotFoundError(
-                    f"Missing VAP checkpoint: {ckpt_path}. Download it with:\n"
-                    f"  mkdir -p {ckpt_path.parent}\n"
-                    f"  curl -L {VAP_STATE_DICT_URL} -o {ckpt_path}"
-                )
+                raise FileNotFoundError(f"Missing VAP checkpoint: {ckpt_path}")
             try:
                 state = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
             except TypeError:
@@ -437,7 +432,7 @@ class MimiFeatureChunkDataset(Dataset):
     """Chunk index for precomputed Mimi training without repeatedly reading WAV files."""
 
     def __init__(self, manifest_path: str, cfg: dict[str, Any], *, training: bool) -> None:
-        from turnnat.data.manifest import load_manifest
+        from dualturn.data.manifest import load_manifest
 
         self.rows = load_manifest(manifest_path)
         self.sample_rate = int(cfg["data"]["target_sample_rate"])
@@ -569,11 +564,11 @@ def resample_vad_50hz(vad_50hz: torch.Tensor, target_frames: int, target_frame_h
 
 
 class OfficialVadLabeler:
-    """Build the shared 50 Hz binary VAD labels used by all FVAD targets.
+    """Build binary VAD labels without using the dataset RMS fallback.
 
-    The public training path follows the paper pipeline: obtain per-channel
-    Silero VAD, clean short speech/silence islands, then adapt that same VAD
-    stream to the VAP and DualTurn frame grids.
+    VAP official training consumes precomputed vad_list segments and converts them to
+    frame one-hot labels. OtoSpeech manifests here do not contain those segments, so
+    the reproducible official source for this data is DualTurn's Silero preprocessing.
     """
 
     def __init__(
@@ -608,8 +603,10 @@ class OfficialVadLabeler:
 
             self.models = [load_silero_vad().eval(), load_silero_vad().eval()]
             print("VAD label source: Silero official DualTurn preprocessing")
+        elif source == "dataset":
+            print("VAD label source: dataset signal_targets (debug fallback; may be RMS)")
         else:
-            raise ValueError(f"Unsupported vad_source={source}; public training supports source='silero'")
+            raise ValueError(f"Unsupported vad_source={source}")
 
     @torch.no_grad()
 
@@ -644,6 +641,9 @@ class OfficialVadLabeler:
     def __call__(self, batch: dict[str, Any], device: torch.device) -> torch.Tensor:
         if self.cache_dir is not None:
             return self._cached_batch(batch, device)
+        if self.source == "dataset":
+            return batch["signal_targets"]["vad"].to(device)
+
         from silero_vad import get_speech_timestamps
 
         audio = batch["audio"].detach().float().cpu()
@@ -834,6 +834,103 @@ def vap256_labels(
     return labels
 
 
+def _boolean_runs_np(mask: np.ndarray) -> list[tuple[int, int]]:
+    if mask.size == 0:
+        return []
+    padded = np.concatenate([[False], mask.astype(bool), [False]])
+    starts = np.flatnonzero(~padded[:-1] & padded[1:])
+    ends = np.flatnonzero(padded[:-1] & ~padded[1:])
+    return [(int(s), int(e)) for s, e in zip(starts, ends)]
+
+
+def _active_ratio_np(vad: np.ndarray, speaker: int, start_s: float, end_s: float) -> float:
+    lo = max(0, int(math.floor(start_s * 50.0)))
+    hi = min(vad.shape[0], int(math.ceil(end_s * 50.0)))
+    if hi <= lo:
+        return 0.0
+    return float((vad[lo:hi, speaker] > 0).mean())
+
+
+def unit_boundary_frame_weights(
+    vad_50hz: torch.Tensor,
+    frame_valid_mask: torch.Tensor,
+    *,
+    model_frame_hz: float,
+    alpha: float,
+    unit_pre_s: float,
+    unit_post_s: float,
+    min_utterance_s: float,
+    unit_mode: str,
+    utterance_merge_gap_s: float,
+    utterance_merge_other_max_ratio: float,
+) -> torch.Tensor | None:
+    """Frame weights matching the no-anchor VAD utterance-boundary scorer."""
+    if alpha <= 1.0:
+        return None
+    B, _, _ = vad_50hz.shape
+    T_model = int(frame_valid_mask.shape[1])
+    weights = torch.ones((B, T_model), dtype=torch.float32, device=frame_valid_mask.device)
+    vad_np = (vad_50hz.detach().float().cpu().numpy().transpose(0, 2, 1) >= 0.5)
+    valid_counts = (frame_valid_mask.detach().cpu().numpy() > 0.5).sum(axis=1)
+
+    for b in range(B):
+        duration_s = float(valid_counts[b] / model_frame_hz)
+        if duration_s <= 0:
+            continue
+        vad = vad_np[b]
+        raw_segments: list[dict[str, Any]] = []
+        for speaker in range(2):
+            for start, end in _boolean_runs_np(vad[:, speaker]):
+                raw_segments.append({
+                    "speaker": int(speaker),
+                    "start": float(start / 50.0),
+                    "end": float(end / 50.0),
+                    "duration": float((end - start) / 50.0),
+                })
+
+        merged: list[dict[str, Any]] = []
+        for speaker in (0, 1):
+            current: dict[str, Any] | None = None
+            speaker_segments = sorted(
+                [dict(seg) for seg in raw_segments if int(seg["speaker"]) == speaker],
+                key=lambda x: (x["start"], x["end"]),
+            )
+            for seg in speaker_segments:
+                if current is None:
+                    current = seg
+                    continue
+                gap_s = float(seg["start"] - current["end"])
+                other_ratio = _active_ratio_np(vad, 1 - speaker, current["end"], seg["start"])
+                if gap_s <= utterance_merge_gap_s and other_ratio <= utterance_merge_other_max_ratio:
+                    current["end"] = float(seg["end"])
+                    current["duration"] = float(current["end"] - current["start"])
+                else:
+                    merged.append(current)
+                    current = seg
+            if current is not None:
+                merged.append(current)
+
+        for seg in merged:
+            if float(seg["duration"]) < min_utterance_s:
+                continue
+            intervals: list[tuple[float, float]] = []
+            if unit_mode in {"boundaries", "both"}:
+                intervals.append((float(seg["start"]) - unit_pre_s, float(seg["start"]) + unit_post_s))
+                intervals.append((float(seg["end"]) - unit_pre_s, float(seg["end"]) + unit_post_s))
+            if unit_mode in {"spans", "both"}:
+                intervals.append((float(seg["start"]) - unit_pre_s, float(seg["end"]) + unit_post_s))
+            for start_s, end_s in intervals:
+                start_s = max(0.0, start_s)
+                end_s = min(duration_s, end_s)
+                if end_s <= start_s:
+                    continue
+                lo = max(0, int(math.floor(start_s * model_frame_hz)))
+                hi = min(T_model, int(math.ceil(end_s * model_frame_hz)))
+                if hi > lo:
+                    weights[b, lo:hi] = float(alpha)
+    return weights
+
+
 def future_vad_loss(
     logits: torch.Tensor,
     vad_50hz: torch.Tensor,
@@ -845,6 +942,7 @@ def future_vad_loss(
     context_frames: int,
     objective_type: str,
     target_scheme: str,
+    frame_weights: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     states, valid = fvad_targets(
         vad_50hz,
@@ -860,6 +958,7 @@ def future_vad_loss(
         valid,
         context_frames=context_frames,
         objective_type=objective_type,
+        frame_weights=frame_weights,
     )
 
 
@@ -870,11 +969,14 @@ def future_vad_loss_from_targets(
     *,
     context_frames: int,
     objective_type: str,
+    frame_weights: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     T = min(logits.shape[1], states.shape[1], valid.shape[1])
     logits = logits[:, :T]
     states = states[:, :T]
     valid = valid[:, :T]
+    if frame_weights is not None:
+        frame_weights = frame_weights[:, :T].to(device=logits.device, dtype=logits.dtype)
     if context_frames > 0:
         valid[:, :context_frames] = False
 
@@ -885,28 +987,41 @@ def future_vad_loss_from_targets(
             "loss": zero,
             "nll_sum": zero.detach(),
             "valid_frames": zero.detach(),
+            "weighted_nll_sum": zero.detach(),
+            "weighted_valid_frames": zero.detach(),
             "correct_frames": zero.detach(),
         }
 
     if objective_type == "categorical256":
         powers = torch.tensor([1 << i for i in range(8)], dtype=torch.long, device=logits.device)
         labels = (states.long() * powers).sum(dim=-1)
-        nll_sum = F.cross_entropy(logits[valid], labels[valid], reduction="sum")
+        frame_nll_valid = F.cross_entropy(logits[valid], labels[valid], reduction="none")
+        nll_sum = frame_nll_valid.sum()
         pred = logits.argmax(dim=-1)
         correct = (pred[valid] == labels[valid]).sum().float()
     elif objective_type == "bernoulli8":
         if logits.shape[-1] != 8:
             raise ValueError(f"DualTurn FVAD expects 8 logits, got {logits.shape[-1]}")
         frame_nll = F.binary_cross_entropy_with_logits(logits, states, reduction="none").mean(dim=-1)
-        nll_sum = frame_nll[valid].sum()
+        frame_nll_valid = frame_nll[valid]
+        nll_sum = frame_nll_valid.sum()
         pred_bits = logits >= 0
         correct = (pred_bits[valid] == states[valid].bool()).all(dim=-1).sum().float()
     else:
         raise ValueError(f"Unsupported objective_type={objective_type}")
+    if frame_weights is not None:
+        weight_valid = frame_weights[valid]
+        weighted_nll_sum = (frame_nll_valid * weight_valid).sum()
+        weighted_valid_frames = weight_valid.sum().clamp_min(1.0)
+    else:
+        weighted_nll_sum = nll_sum
+        weighted_valid_frames = valid_frames
     return {
-        "loss": nll_sum / valid_frames,
+        "loss": weighted_nll_sum / weighted_valid_frames,
         "nll_sum": nll_sum.detach(),
         "valid_frames": valid_frames.detach(),
+        "weighted_nll_sum": weighted_nll_sum.detach(),
+        "weighted_valid_frames": weighted_valid_frames.detach(),
         "correct_frames": correct.detach(),
     }
 
@@ -918,7 +1033,7 @@ def dualturn_event_targets(
     threshold_ratio: float,
 ) -> dict[str, torch.Tensor]:
     """Derive the official-style VAD/EOT/HOLD/BOT/BC pseudo-labels from shared VAD."""
-    from turnnat.data.vad import derive_signals
+    from dualturn.data.vad import derive_signals
 
     vad = vad50_to_model_vad(
         vad_50hz,
@@ -1127,6 +1242,385 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerows(rows)
 
 
+class NaturalnessFiveTypeEvaluator:
+    def __init__(
+        self,
+        *,
+        manifest: Path,
+        output_dir: Path,
+        sample_rate: int,
+        samples_per_frame: int,
+        model_frame_hz: float,
+        bin_frames_50hz: list[int],
+        threshold_ratio: float,
+        bernoulli_head_reduction: str,
+        batch_size: int,
+        limit: int | None,
+        vad_source: str,
+        rms_threshold: float,
+        silero_threshold: float,
+        silero_min_speech_ms: int,
+        silero_min_silence_ms: int,
+        clean_min_speech_ms: int,
+        clean_min_silence_ms: int,
+        context_s: float,
+        tail_gamma: float,
+        lambda_mean: float,
+        unit_pre_s: float,
+        unit_post_s: float,
+        min_unit_frames: int,
+        min_utterance_s: float,
+        utterance_merge_gap_s: float,
+        utterance_merge_other_max_ratio: float,
+        unit_mode: str,
+    ) -> None:
+        from dualturn.scripts import evaluate_naturalness_5types as nat5
+        from dualturn.scripts import score_vap_nll_naturalness as vap_nll_base
+
+        if not manifest.is_file():
+            raise FileNotFoundError(manifest)
+        self.base = vap_nll_base
+        self.nat5 = nat5
+        self.manifest = manifest
+        self.output_dir = output_dir
+        self.sample_rate = int(sample_rate)
+        self.samples_per_frame = int(samples_per_frame)
+        self.model_frame_hz = float(model_frame_hz)
+        self.bin_frames_50hz = list(bin_frames_50hz)
+        self.threshold_ratio = float(threshold_ratio)
+        self.bernoulli_head_reduction = str(bernoulli_head_reduction)
+        if self.bernoulli_head_reduction not in {"mean", "sum"}:
+            raise ValueError(f"Invalid Bernoulli head reduction: {self.bernoulli_head_reduction}")
+        self.batch_size = int(batch_size)
+        self.vad_source = str(vad_source)
+        self.rms_threshold = float(rms_threshold)
+        self.silero_threshold = float(silero_threshold)
+        self.silero_min_speech_ms = int(silero_min_speech_ms)
+        self.silero_min_silence_ms = int(silero_min_silence_ms)
+        self.clean_min_speech_ms = int(clean_min_speech_ms)
+        self.clean_min_silence_ms = int(clean_min_silence_ms)
+        self.context_s = float(context_s)
+        self.tail_gamma = float(tail_gamma)
+        self.lambda_mean = float(lambda_mean)
+        self.unit_pre_s = float(unit_pre_s)
+        self.unit_post_s = float(unit_post_s)
+        self.min_unit_frames = int(min_unit_frames)
+        self.min_utterance_s = float(min_utterance_s)
+        self.utterance_merge_gap_s = float(utterance_merge_gap_s)
+        self.utterance_merge_other_max_ratio = float(utterance_merge_other_max_ratio)
+        self.unit_mode = str(unit_mode)
+        self.rows = self.base.read_manifest(manifest)
+        self.limit = limit
+        if limit is not None:
+            self.rows = self.rows[: int(limit)]
+        if self.batch_size < 1:
+            raise ValueError("naturalness batch_size must be >= 1")
+        self.silero_models = self.base.load_silero_models() if self.vad_source == "silero" else None
+        print(f"Naturalness 5types eval: {len(self.rows)} pairs from {manifest}; pair_batch_size={self.batch_size}")
+
+    def _pair_segments(self, row: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any]]:
+        session_id = str(row.get("session_id") or row.get("id") or Path(row["audio_path"]).stem)
+        pair_id = str(row.get("pair_id") or session_id)
+        edit_type = str(
+            row.get("edit_type")
+            or row.get("type")
+            or row.get("augmentation_type")
+            or ""
+        )
+        natural_audio_raw = str(row.get("natural_audio_path") or "").strip()
+        natural_audio = Path(natural_audio_raw) if natural_audio_raw and natural_audio_raw != "." else None
+        if natural_audio is None:
+            meta = self.base.read_json(row["json_path"])
+            natural_audio = self.base.natural_reference_from_meta(meta, row["json_path"])
+        edited = {
+            "segment_id": session_id,
+            "condition": "edited",
+            "version": "edited",
+            "pair_id": pair_id,
+            "edit_type": edit_type,
+            "audio_path": Path(row["audio_path"]),
+        }
+        natural = {
+            "segment_id": f"{pair_id}__natural_ref_for__{session_id}",
+            "condition": "natural",
+            "version": "original",
+            "pair_id": pair_id,
+            "edit_type": edit_type,
+            "audio_path": natural_audio,
+        }
+        return natural, edited
+
+    def _prepare_segment(self, item: dict[str, Any]) -> dict[str, Any]:
+        model_audio = self.base.load_stereo_audio(Path(item["audio_path"]), self.sample_rate)
+        vad_audio = self.base.load_stereo_audio(Path(item["audio_path"]), 16_000)
+        duration_s = float(model_audio.shape[-1] / self.sample_rate)
+        vad_pack = self.base.observed_vad_50hz(
+            vad_audio,
+            sr=16_000,
+            vad_source=self.vad_source,
+            silero_models=self.silero_models,
+            rms_threshold=self.rms_threshold,
+            silero_threshold=self.silero_threshold,
+            silero_min_speech_ms=self.silero_min_speech_ms,
+            silero_min_silence_ms=self.silero_min_silence_ms,
+            clean_min_speech_ms=self.clean_min_speech_ms,
+            clean_min_silence_ms=self.clean_min_silence_ms,
+        )
+        units = self.base.extract_utterance_units(
+            vad_pack["clean"],
+            frame_hz=50.0,
+            duration_s=duration_s,
+            unit_pre_s=self.unit_pre_s,
+            unit_post_s=self.unit_post_s,
+            min_utterance_s=self.min_utterance_s,
+            unit_mode=self.unit_mode,
+            utterance_merge_gap_s=self.utterance_merge_gap_s,
+            utterance_merge_other_max_ratio=self.utterance_merge_other_max_ratio,
+        )
+        return {**item, "audio": model_audio, "duration_s": duration_s, "vad_clean": vad_pack["clean"], "units": units}
+
+    def _vad_to_model_frames(self, vad_50hz: np.ndarray, target_frames: int) -> np.ndarray:
+        out = np.zeros((target_frames, 2), dtype=np.int8)
+        if target_frames <= 0:
+            return out
+        for i in range(target_frames):
+            lo = int(math.floor(i * 50.0 / self.model_frame_hz))
+            hi = int(math.floor((i + 1) * 50.0 / self.model_frame_hz))
+            hi = max(hi, lo + 1)
+            if lo < vad_50hz.shape[0]:
+                out[i] = (vad_50hz[lo:min(hi, vad_50hz.shape[0])].mean(axis=0) >= 0.5).astype(np.int8)
+        return out
+
+    @torch.no_grad()
+    def _score_prepared_batch(
+        self,
+        model: nn.Module,
+        prepared: list[dict[str, Any]],
+        *,
+        device: torch.device,
+        use_autocast: bool,
+        autocast_dtype: torch.dtype | None,
+    ) -> list[dict[str, Any]]:
+        max_samples = max(int(item["audio"].shape[-1]) for item in prepared)
+        audio_batch = torch.stack([
+            F.pad(item["audio"], (0, max_samples - int(item["audio"].shape[-1])))
+            for item in prepared
+        ]).to(device)
+        with autocast(device_type=device.type, enabled=use_autocast, dtype=autocast_dtype):
+            logits_batch = model(audio_batch)
+        logits_batch = logits_batch.float()
+        results = []
+        for index, item in enumerate(prepared):
+            logits = logits_batch[index:index + 1]
+            T = int(logits.shape[1])
+            valid_frames = min(T, int(math.ceil(float(item["audio"].shape[-1]) / self.samples_per_frame)))
+            frame_valid_mask = torch.zeros((1, T), dtype=torch.float32, device=device)
+            frame_valid_mask[:, :valid_frames] = 1.0
+            vad_50 = torch.from_numpy(item["vad_clean"].T.astype(np.float32)).unsqueeze(0).to(device)
+            states, valid = fvad_targets(
+                vad_50,
+                frame_valid_mask,
+                self.bin_frames_50hz,
+                model_frame_hz=self.model_frame_hz,
+                threshold_ratio=self.threshold_ratio,
+                target_scheme=model.target_scheme,
+            )
+            n = min(T, int(states.shape[1]))
+            nll = np.full((n,), np.nan, dtype=np.float32)
+            targets = np.full((n,), IGNORE_INDEX, dtype=np.int64)
+            if n > 0:
+                states_n = states[:, :n]
+                valid_n = valid[:, :n]
+                if bool(valid_n.any()):
+                    powers = torch.tensor([1 << i for i in range(8)], dtype=torch.long, device=device)
+                    packed_targets = ((states_n >= self.threshold_ratio).long() * powers).sum(dim=-1)
+                    if model.objective_type == "categorical256":
+                        losses = F.cross_entropy(
+                            logits[:, :n].reshape(-1, logits.shape[-1]),
+                            packed_targets.reshape(-1),
+                            reduction="none",
+                        ).reshape(1, n)
+                    elif model.objective_type == "bernoulli8":
+                        per_bit_losses = F.binary_cross_entropy_with_logits(
+                            logits[:, :n], states_n, reduction="none"
+                        )
+                        if self.bernoulli_head_reduction == "sum":
+                            losses = per_bit_losses.sum(dim=-1)
+                        else:
+                            losses = per_bit_losses.mean(dim=-1)
+                    else:
+                        raise ValueError(f"Unsupported objective_type={model.objective_type}")
+                    valid_np = valid_n.squeeze(0).detach().cpu().numpy().astype(bool)
+                    nll[valid_np] = losses.squeeze(0).detach().cpu().numpy()[valid_np]
+                    targets[valid_np] = packed_targets.squeeze(0).detach().cpu().numpy()[valid_np]
+            vad_model = self._vad_to_model_frames(item["vad_clean"], len(nll))
+            unit_rows = self.base.unit_rows_from_units(
+                nll,
+                item["units"],
+                vad=vad_model,
+                segment_id=item["segment_id"],
+                frame_hz=self.model_frame_hz,
+                context_s=self.context_s,
+                min_unit_frames=self.min_unit_frames,
+            )
+            aggregate = self.base.aggregate_unit_rows(unit_rows, gamma=self.tail_gamma, lam=self.lambda_mean)
+            aggregate.update({
+                "segment_id": item["segment_id"],
+                "condition": item["condition"],
+                "version": item["version"],
+                "pair_id": item["pair_id"],
+                "edit_type": item["edit_type"],
+                "audio_path": str(item["audio_path"]),
+                "duration_s": item["duration_s"],
+                "all_frame_mean_nll": float(np.nanmean(nll)) if np.isfinite(nll).any() else float("nan"),
+                "num_nll_frames": int(np.isfinite(nll).sum()),
+                "units": unit_rows,
+                "targets": targets,
+            })
+            results.append(aggregate)
+        del audio_batch, logits_batch
+        return results
+
+    def _wandb_payload(self, flat_rows: list[dict[str, Any]]) -> dict[str, float | int]:
+        payload: dict[str, float | int] = {}
+        wanted = {
+            "natural_mean_nll_mean": "natural_mean_nll",
+            "edited_mean_nll_mean": "edited_mean_nll",
+            "delta_mean_nll_mean": "delta_mean_nll",
+            "natural_tail_nll_mean": "natural_tail_nll",
+            "edited_tail_nll_mean": "edited_tail_nll",
+            "delta_tail_nll_mean": "delta_tail_nll",
+            "natural_dialogue_nll_mean": "natural_dialogue_nll",
+            "edited_dialogue_nll_mean": "edited_dialogue_nll",
+            "delta_nll_mean": "delta_nll",
+            "pairwise_accuracy": "pairwise_acc",
+            "c_index": "c_index",
+            "n": "n",
+        }
+        for row in flat_rows:
+            label = str(row["type"])
+            prefix = f"naturalness/{label}"
+            for src, dst in wanted.items():
+                value = row.get(src)
+                if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    payload[f"{prefix}/{dst}"] = float(value) if src != "n" else int(value)
+        return payload
+
+    @torch.no_grad()
+    def run(
+        self,
+        model: nn.Module,
+        *,
+        device: torch.device,
+        epoch: int | None,
+        global_step: int,
+        use_autocast: bool,
+        autocast_dtype: torch.dtype | None,
+    ) -> dict[str, Any]:
+        was_training = model.training
+        model.eval()
+        pair_rows: list[dict[str, Any]] = []
+        segment_rows: list[dict[str, Any]] = []
+        unit_rows: list[dict[str, Any]] = []
+        for batch_start in tqdm(range(0, len(self.rows), self.batch_size), desc=f"naturalness step{global_step}", leave=False):
+            batch_rows = self.rows[batch_start:batch_start + self.batch_size]
+            infos = [self._pair_segments(row) for row in batch_rows]
+            prepared = []
+            for natural, edited in infos:
+                prepared.append(self._prepare_segment(natural))
+                prepared.append(self._prepare_segment(edited))
+            scored = self._score_prepared_batch(
+                model,
+                prepared,
+                device=device,
+                use_autocast=use_autocast,
+                autocast_dtype=autocast_dtype,
+            )
+            for local_index, (natural_info, edited_info) in enumerate(infos):
+                natural = scored[2 * local_index]
+                edited = scored[2 * local_index + 1]
+                for segment in (natural, edited):
+                    segment_rows.append({
+                        "segment_id": segment["segment_id"],
+                        "condition": segment["condition"],
+                        "pair_id": segment["pair_id"],
+                        "version": segment["version"],
+                        "edit_type": segment["edit_type"],
+                        "audio_path": segment["audio_path"],
+                        "duration_s": segment["duration_s"],
+                        "all_frame_mean_nll": segment["all_frame_mean_nll"],
+                        "mean_nll": segment["mean_nll"],
+                        "tail_nll": segment["tail_nll"],
+                        "dialog_nll": segment["dialog_nll"],
+                        "nat_score": segment["nat_score"],
+                        "num_units": segment["num_units"],
+                        "tail_k": segment["tail_k"],
+                        "num_nll_frames": segment["num_nll_frames"],
+                    })
+                    unit_rows.extend(segment["units"])
+                delta_nll = float(edited["dialog_nll"]) - float(natural["dialog_nll"])
+                pair_rows.append({
+                    "pair_id": natural["pair_id"],
+                    "edit_type": natural["edit_type"],
+                    "original_segment_id": natural["segment_id"],
+                    "edited_segment_id": edited["segment_id"],
+                    "original_audio_path": natural["audio_path"],
+                    "edited_audio_path": edited["audio_path"],
+                    "original_all_frame_mean_nll": natural["all_frame_mean_nll"],
+                    "original_mean_nll": natural["mean_nll"],
+                    "original_tail_nll": natural["tail_nll"],
+                    "original_dialog_nll": natural["dialog_nll"],
+                    "edited_all_frame_mean_nll": edited["all_frame_mean_nll"],
+                    "edited_mean_nll": edited["mean_nll"],
+                    "edited_tail_nll": edited["tail_nll"],
+                    "edited_dialog_nll": edited["dialog_nll"],
+                    "delta_nll": delta_nll,
+                    "edited_more_unnatural": bool(delta_nll > 0),
+                    "original_num_units": natural["num_units"],
+                    "edited_num_units": edited["num_units"],
+                })
+            del prepared, scored
+        by_type: dict[str, list[dict[str, Any]]] = {}
+        for row in pair_rows:
+            by_type.setdefault(str(row["edit_type"]), []).append(row)
+        expected_all = list(self.nat5.TYPE_ORDER)
+        expected = expected_all if self.limit is None else [name for name in expected_all if name in by_type]
+        missing = [name for name in expected if name not in by_type]
+        unexpected = sorted(set(by_type) - set(expected_all))
+        if missing or unexpected:
+            raise ValueError(f"Naturalness type mismatch: missing={missing}, unexpected={unexpected}")
+        summaries = {name: self.nat5.summarize(by_type[name]) for name in expected}
+        summaries["overall"] = self.nat5.summarize(pair_rows)
+        flat_rows = [self.nat5.flatten(name, summaries[name]) for name in expected]
+        flat_rows.append(self.nat5.flatten("overall", summaries["overall"]))
+        out_dir = self.output_dir / f"step_{global_step:08d}"
+        _write_csv(out_dir / "pair_scores.csv", pair_rows)
+        _write_csv(out_dir / "segment_scores.csv", segment_rows)
+        _write_csv(out_dir / "units.csv", unit_rows)
+        _write_csv(out_dir / "metrics.csv", flat_rows)
+        payload = {
+            "metric": "future_vad_naturalness_5types",
+            "objective_type": model.objective_type,
+            "fvad_target_scheme": model.target_scheme,
+            "frame_nll_reduction": (
+                "categorical_ce" if model.objective_type == "categorical256"
+                else f"bernoulli_{self.bernoulli_head_reduction}"
+            ),
+            "epoch": epoch,
+            "global_step": global_step,
+            "manifest": str(self.manifest),
+            "model_frame_hz": self.model_frame_hz,
+            "label_frame_hz": 50.0,
+            "num_pairs": len(pair_rows),
+            "batch_size": self.batch_size,
+            "by_type": {name: summaries[name] for name in expected},
+            "overall": summaries["overall"],
+        }
+        (out_dir / "metrics.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        if was_training:
+            model.train(True)
+        return {"summary": payload, "flat_rows": flat_rows, "wandb": self._wandb_payload(flat_rows), "output_dir": str(out_dir)}
+
 def run_epoch(
     *,
     model: nn.Module,
@@ -1153,6 +1647,19 @@ def run_epoch(
     eval_loaders: dict[str, DataLoader] | None = None,
     eval_max_batches: int | None = None,
     eval_history: list[dict[str, Any]] | None = None,
+    naturalness_evaluator: NaturalnessFiveTypeEvaluator | None = None,
+    naturalness_every_steps: int = 0,
+    naturalness_history: list[dict[str, Any]] | None = None,
+    naturalness_checkpoint_metric: str = "none",
+    naturalness_best_state: dict[str, float | int] | None = None,
+    checkpoint_dir: Path | None = None,
+    event_weight_alpha: float = 1.0,
+    event_weight_unit_pre_s: float = 2.0,
+    event_weight_unit_post_s: float = 0.0,
+    event_weight_min_utterance_s: float = 0.5,
+    event_weight_unit_mode: str = "boundaries",
+    event_weight_utterance_merge_gap_s: float = 1.0,
+    event_weight_utterance_merge_other_max_ratio: float = 0.2,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -1160,6 +1667,8 @@ def run_epoch(
     totals = {
         "nll_sum": 0.0,
         "valid_frames": 0.0,
+        "weighted_nll_sum": 0.0,
+        "weighted_valid_frames": 0.0,
         "correct_frames": 0.0,
         "objective_loss_sum": 0.0,
         "num_batches": 0.0,
@@ -1211,6 +1720,18 @@ def run_epoch(
                     and model.objective_type == "bernoulli8"
                     and model.target_scheme == "native-soft"
                 )
+                frame_weights = unit_boundary_frame_weights(
+                    vad_50hz,
+                    batch["frame_valid_mask"],
+                    model_frame_hz=model_frame_hz,
+                    alpha=event_weight_alpha,
+                    unit_pre_s=event_weight_unit_pre_s,
+                    unit_post_s=event_weight_unit_post_s,
+                    min_utterance_s=event_weight_min_utterance_s,
+                    unit_mode=event_weight_unit_mode,
+                    utterance_merge_gap_s=event_weight_utterance_merge_gap_s,
+                    utterance_merge_other_max_ratio=event_weight_utterance_merge_other_max_ratio,
+                )
                 if use_cached_native_fvad:
                     cached_valid = (cached_signals["fvad_mask"] > 0.5) & (
                         batch["frame_valid_mask"] > 0.5
@@ -1221,6 +1742,7 @@ def run_epoch(
                         cached_valid,
                         context_frames=context_frames,
                         objective_type=model.objective_type,
+                        frame_weights=frame_weights,
                     )
                 else:
                     out = future_vad_loss(
@@ -1233,6 +1755,7 @@ def run_epoch(
                         context_frames=context_frames,
                         objective_type=model.objective_type,
                         target_scheme=model.target_scheme,
+                        frame_weights=frame_weights,
                     )
                 loss = out["loss"]
                 if predictions is not None and getattr(model, "vap_vad_loss_weight", 0.0) > 0:
@@ -1278,6 +1801,8 @@ def run_epoch(
 
         totals["nll_sum"] += float(out["nll_sum"].cpu())
         totals["valid_frames"] += float(out["valid_frames"].cpu())
+        totals["weighted_nll_sum"] += float(out.get("weighted_nll_sum", out["nll_sum"]).cpu())
+        totals["weighted_valid_frames"] += float(out.get("weighted_valid_frames", out["valid_frames"]).cpu())
         totals["correct_frames"] += float(out["correct_frames"].cpu())
         totals["objective_loss_sum"] += float(loss.detach().cpu())
         totals["num_batches"] += 1.0
@@ -1328,7 +1853,14 @@ def run_epoch(
             and eval_loaders
             and global_step % eval_every_steps == 0
         )
-        if do_loss_eval:
+        do_naturalness_eval = (
+            training
+            and global_step is not None
+            and naturalness_evaluator is not None
+            and naturalness_every_steps > 0
+            and global_step % naturalness_every_steps == 0
+        )
+        if do_loss_eval or do_naturalness_eval:
             print(f"\n[future-VAD] mid-epoch eval at global_step={global_step}")
             eval_row: dict[str, Any] = {"epoch": epoch, "global_step": global_step, "eval": {}}
             if do_loss_eval and eval_loaders:
@@ -1350,6 +1882,13 @@ def run_epoch(
                             grad_clip=None,
                             max_batches=eval_max_batches,
                             desc=f"{eval_name} step{global_step}",
+                            event_weight_alpha=event_weight_alpha,
+                            event_weight_unit_pre_s=event_weight_unit_pre_s,
+                            event_weight_unit_post_s=event_weight_unit_post_s,
+                            event_weight_min_utterance_s=event_weight_min_utterance_s,
+                            event_weight_unit_mode=event_weight_unit_mode,
+                            event_weight_utterance_merge_gap_s=event_weight_utterance_merge_gap_s,
+                            event_weight_utterance_merge_other_max_ratio=event_weight_utterance_merge_other_max_ratio,
                         )
                     eval_row["eval"][eval_name] = metrics
                     print(
@@ -1369,6 +1908,52 @@ def run_epoch(
                                 "global_step": global_step,
                             },
                             step=global_step,
+                        )
+            if do_naturalness_eval and naturalness_evaluator is not None:
+                print(f"[future-VAD] naturalness 5types eval at global_step={global_step}")
+                nat_metrics = naturalness_evaluator.run(
+                    model,
+                    device=device,
+                    epoch=epoch,
+                    global_step=global_step,
+                    use_autocast=use_autocast,
+                    autocast_dtype=autocast_dtype,
+                )
+                eval_row["naturalness_5types"] = nat_metrics["summary"]
+                print(f"naturalness_5types saved -> {nat_metrics['output_dir']}")
+                if wandb_run is not None:
+                    payload = dict(nat_metrics["wandb"])
+                    payload.update({"epoch": epoch, "global_step": global_step})
+                    wandb_run.log(payload, step=global_step)
+                if naturalness_history is not None:
+                    naturalness_history.append(nat_metrics["summary"])
+                if (
+                    naturalness_checkpoint_metric != "none"
+                    and naturalness_best_state is not None
+                    and checkpoint_dir is not None
+                    and optimizer is not None
+                ):
+                    metric_value = float(
+                        nat_metrics["summary"]["overall"][naturalness_checkpoint_metric]
+                    )
+                    if metric_value > float(naturalness_best_state.get("value", float("-inf"))):
+                        naturalness_best_state.update({"value": metric_value, "global_step": global_step})
+                        checkpoint_path = checkpoint_dir / f"best_naturalness_{naturalness_checkpoint_metric}.pt"
+                        save_checkpoint(
+                            checkpoint_path,
+                            {
+                                "epoch": epoch,
+                                "global_step": global_step,
+                                "model_state": model.state_dict(),
+                                "optimizer_state": optimizer.state_dict(),
+                                "args": getattr(model, "checkpoint_args", {}),
+                                "naturalness_metric": naturalness_checkpoint_metric,
+                                "naturalness_metric_value": metric_value,
+                            },
+                        )
+                        print(
+                            f"Saved best trained naturalness checkpoint: {checkpoint_path} "
+                            f"({naturalness_checkpoint_metric}={metric_value:.6f})"
                         )
             if eval_history is not None:
                 eval_history.append(eval_row)
@@ -1539,7 +2124,19 @@ def main() -> None:
     ap.add_argument("--vap-bin-times", type=parse_float_list, default=DEFAULT_VAP_BIN_TIMES)
     ap.add_argument("--threshold-ratio", type=float, default=0.5)
     ap.add_argument("--context-seconds", type=float, default=0.0)
-    ap.add_argument("--vad-source", choices=["silero"], default="silero")
+    ap.add_argument(
+        "--event-weight-alpha",
+        type=float,
+        default=1.0,
+        help="FVAD loss weight for frames inside VAD utterance-boundary units. 1.0 disables weighting.",
+    )
+    ap.add_argument("--event-weight-unit-pre-s", type=float, default=2.0)
+    ap.add_argument("--event-weight-unit-post-s", type=float, default=0.0)
+    ap.add_argument("--event-weight-min-utterance-s", type=float, default=0.5)
+    ap.add_argument("--event-weight-utterance-merge-gap-s", type=float, default=1.0)
+    ap.add_argument("--event-weight-utterance-merge-other-max-ratio", type=float, default=0.2)
+    ap.add_argument("--event-weight-unit-mode", choices=["boundaries", "spans", "both"], default="boundaries")
+    ap.add_argument("--vad-source", choices=["silero", "dataset"], default="silero")
     ap.add_argument("--vad-cache-dir", type=Path, default=None)
     ap.add_argument("--silero-threshold", type=float, default=0.5)
     ap.add_argument("--silero-min-speech-ms", type=int, default=100)
@@ -1550,6 +2147,35 @@ def main() -> None:
     ap.add_argument("--max-val-batches", type=int, default=None)
     ap.add_argument("--max-mid-eval-batches", type=int, default=None)
     ap.add_argument("--eval-every-steps", type=int, default=0)
+    ap.add_argument("--naturalness-manifest", type=Path, default=None)
+    ap.add_argument("--naturalness-output-dir", type=Path, default=None)
+    ap.add_argument("--naturalness-eval-every-steps", type=int, default=0)
+    ap.add_argument("--naturalness-eval-at-start", action="store_true")
+    ap.add_argument(
+        "--naturalness-checkpoint-metric",
+        choices=["none", "pairwise_accuracy", "c_index"],
+        default="none",
+    )
+    ap.add_argument("--naturalness-batch-size", type=int, default=4)
+    ap.add_argument("--naturalness-limit", type=int, default=None)
+    ap.add_argument(
+        "--naturalness-bernoulli-reduction",
+        choices=["mean", "sum"],
+        default="sum",
+        help="Use sum for an 8-bit factorized joint NLL comparable in scale to 256-way CE.",
+    )
+    ap.add_argument("--naturalness-vad-source", choices=["silero", "rms"], default="silero")
+    ap.add_argument("--naturalness-rms-threshold", type=float, default=0.015)
+    ap.add_argument("--naturalness-context-s", type=float, default=3.0)
+    ap.add_argument("--naturalness-tail-gamma", type=float, default=0.25)
+    ap.add_argument("--naturalness-lambda-mean", type=float, default=0.5)
+    ap.add_argument("--naturalness-unit-pre-s", type=float, default=2.0)
+    ap.add_argument("--naturalness-unit-post-s", type=float, default=0.0)
+    ap.add_argument("--naturalness-min-unit-frames", type=int, default=5)
+    ap.add_argument("--naturalness-min-utterance-s", type=float, default=0.5)
+    ap.add_argument("--naturalness-utterance-merge-gap-s", type=float, default=1.0)
+    ap.add_argument("--naturalness-utterance-merge-other-max-ratio", type=float, default=0.2)
+    ap.add_argument("--naturalness-unit-mode", choices=["boundaries", "spans", "both"], default="boundaries")
     ap.add_argument("--device", default=None)
     ap.add_argument("--wandb-project", default=None)
     ap.add_argument("--wandb-run-name", default=None)
@@ -1572,13 +2198,20 @@ def main() -> None:
     using_mimi_features = args.backbone == "dualturn" and args.mimi_feature_root is not None
     if using_mimi_features and args.vad_cache_dir is None:
         raise ValueError("--mimi-feature-root requires --vad-cache-dir so training never falls back to WAV VAD")
-    dataset_cls = MimiFeatureChunkDataset if using_mimi_features else StereoChunkDataset
+    dataset_cls = MimiFeatureChunkDataset if using_mimi_features else OtoSpeechChunkDataset
     collate_fn = collate_mimi_feature_chunks if using_mimi_features else collate_chunks
-    train_ds = dataset_cls(cfg["data"]["train_manifest"], cfg, training=True)
-    val_ds = dataset_cls(cfg["data"]["val_manifest"], cfg, training=False)
+    if using_mimi_features:
+        train_ds = dataset_cls(cfg["data"]["train_manifest"], cfg, training=True)
+        val_ds = dataset_cls(cfg["data"]["val_manifest"], cfg, training=False)
+    else:
+        train_ds = dataset_cls(cfg["data"]["train_manifest"], cfg, stage="stage2", training=True)
+        val_ds = dataset_cls(cfg["data"]["val_manifest"], cfg, stage="stage2", training=False)
     test1_ds = None
     if args.test1_manifest is not None:
-        test1_ds = dataset_cls(str(args.test1_manifest), cfg, training=False)
+        if using_mimi_features:
+            test1_ds = dataset_cls(str(args.test1_manifest), cfg, training=False)
+        else:
+            test1_ds = dataset_cls(str(args.test1_manifest), cfg, stage="stage2", training=False)
     train_loader = DataLoader(
         train_ds,
         batch_size=int(cfg["data"]["train_batch_size"]),
@@ -1632,7 +2265,23 @@ def main() -> None:
 
     if args.resume_ckpt is not None:
         resume_payload = load_training_checkpoint(args.resume_ckpt)
-        model.load_state_dict(resume_payload["model_state"], strict=True)
+        resume_state = resume_payload["model_state"]
+        model_keys = set(model.state_dict().keys())
+        unexpected = sorted(set(resume_state.keys()) - model_keys)
+        if unexpected:
+            ignorable = [
+                k for k in unexpected
+                if "._mimi_encoder." in k or "._mimi_encoder" in k or "_mimi_encoder." in k
+            ]
+            non_ignorable = [k for k in unexpected if k not in set(ignorable)]
+            if non_ignorable:
+                raise RuntimeError(
+                    "Resume checkpoint has unexpected non-Mimi keys: "
+                    + ", ".join(non_ignorable[:20])
+                )
+            resume_state = {k: v for k, v in resume_state.items() if k not in set(ignorable)}
+            print(f"Ignored {len(ignorable)} checkpoint-only Mimi encoder tensors during resume load")
+        model.load_state_dict(resume_state, strict=False if unexpected else True)
         start_epoch = int(resume_payload.get("epoch", 0)) + 1
         history = list(resume_payload.get("history", []))
         prior_val_losses = [
@@ -1657,6 +2306,12 @@ def main() -> None:
         f"losses={'all-six' if getattr(model, 'multitask', False) else 'fvad-only'}"
     )
     print(f"Frame Hz={frame_hz}, label Hz=50.0, VAP bin_times={args.vap_bin_times}, bin_frames_50hz={bin_frames}")
+    print(
+        "Event-weighted FVAD loss: "
+        f"alpha={args.event_weight_alpha}, unit_pre={args.event_weight_unit_pre_s}, "
+        f"unit_post={args.event_weight_unit_post_s}, min_utt={args.event_weight_min_utterance_s}, "
+        f"mode={args.event_weight_unit_mode}"
+    )
     print(f"Trainable params={trainable:,} / total={total:,}")
 
     wandb_run = None
@@ -1699,6 +2354,13 @@ def main() -> None:
                 "label_frame_hz": 50.0,
                 "threshold_ratio": args.threshold_ratio,
                 "context_seconds": args.context_seconds,
+                "event_weight_alpha": args.event_weight_alpha,
+                "event_weight_unit_pre_s": args.event_weight_unit_pre_s,
+                "event_weight_unit_post_s": args.event_weight_unit_post_s,
+                "event_weight_min_utterance_s": args.event_weight_min_utterance_s,
+                "event_weight_unit_mode": args.event_weight_unit_mode,
+                "event_weight_utterance_merge_gap_s": args.event_weight_utterance_merge_gap_s,
+                "event_weight_utterance_merge_other_max_ratio": args.event_weight_utterance_merge_other_max_ratio,
                 "vad_source": args.vad_source,
                 "vad_cache_dir": str(args.vad_cache_dir) if args.vad_cache_dir is not None else None,
                 "trainable_params": trainable,
@@ -1706,6 +2368,13 @@ def main() -> None:
                 "wandb_log_every": args.wandb_log_every,
                 "eval_every_steps": args.eval_every_steps,
                 "max_mid_eval_batches": args.max_mid_eval_batches,
+                "naturalness_manifest": str(args.naturalness_manifest) if args.naturalness_manifest is not None else None,
+                "naturalness_eval_every_steps": args.naturalness_eval_every_steps,
+                "naturalness_eval_at_start": args.naturalness_eval_at_start,
+                "naturalness_checkpoint_metric": args.naturalness_checkpoint_metric,
+                "naturalness_batch_size": args.naturalness_batch_size,
+                "naturalness_limit": args.naturalness_limit,
+                "naturalness_bernoulli_reduction": args.naturalness_bernoulli_reduction,
             },
         )
 
@@ -1735,6 +2404,42 @@ def main() -> None:
     use_amp, amp_dtype, use_scaler = precision_policy(str(cfg["precision"].get("mode", "bf16")), device)
     scaler = GradScaler(device.type, enabled=use_scaler)
 
+    naturalness_evaluator = None
+    if args.naturalness_manifest is not None and (
+        args.naturalness_eval_every_steps > 0 or args.naturalness_eval_at_start
+    ):
+        nat_out = args.naturalness_output_dir
+        if nat_out is None:
+            nat_out = Path(cfg["paths"]["output_dir"]) / "artifacts" / "naturalness_5types"
+        naturalness_evaluator = NaturalnessFiveTypeEvaluator(
+            manifest=args.naturalness_manifest,
+            output_dir=nat_out,
+            sample_rate=int(cfg["data"]["target_sample_rate"]),
+            samples_per_frame=int(cfg["data"]["samples_per_frame"]),
+            model_frame_hz=frame_hz,
+            bin_frames_50hz=bin_frames,
+            threshold_ratio=args.threshold_ratio,
+            bernoulli_head_reduction=args.naturalness_bernoulli_reduction,
+            batch_size=args.naturalness_batch_size,
+            limit=args.naturalness_limit,
+            vad_source=args.naturalness_vad_source,
+            rms_threshold=args.naturalness_rms_threshold,
+            silero_threshold=args.silero_threshold,
+            silero_min_speech_ms=args.silero_min_speech_ms,
+            silero_min_silence_ms=args.silero_min_silence_ms,
+            clean_min_speech_ms=args.clean_min_speech_ms,
+            clean_min_silence_ms=args.clean_min_silence_ms,
+            context_s=args.naturalness_context_s,
+            tail_gamma=args.naturalness_tail_gamma,
+            lambda_mean=args.naturalness_lambda_mean,
+            unit_pre_s=args.naturalness_unit_pre_s,
+            unit_post_s=args.naturalness_unit_post_s,
+            min_unit_frames=args.naturalness_min_unit_frames,
+            min_utterance_s=args.naturalness_min_utterance_s,
+            utterance_merge_gap_s=args.naturalness_utterance_merge_gap_s,
+            utterance_merge_other_max_ratio=args.naturalness_utterance_merge_other_max_ratio,
+            unit_mode=args.naturalness_unit_mode,
+        )
 
     if resume_payload is not None and "optimizer_state" in resume_payload:
         optimizer.load_state_dict(resume_payload["optimizer_state"])
@@ -1775,12 +2480,27 @@ def main() -> None:
             "test1_manifest": str(args.test1_manifest) if args.test1_manifest is not None else None,
             "eval_every_steps": args.eval_every_steps,
             "max_mid_eval_batches": args.max_mid_eval_batches,
+            "naturalness_manifest": str(args.naturalness_manifest) if args.naturalness_manifest is not None else None,
+            "naturalness_output_dir": str(args.naturalness_output_dir) if args.naturalness_output_dir is not None else None,
+            "naturalness_eval_every_steps": args.naturalness_eval_every_steps,
+            "naturalness_eval_at_start": args.naturalness_eval_at_start,
+            "naturalness_checkpoint_metric": args.naturalness_checkpoint_metric,
+            "naturalness_batch_size": args.naturalness_batch_size,
+            "naturalness_limit": args.naturalness_limit,
+            "naturalness_bernoulli_reduction": args.naturalness_bernoulli_reduction,
             "frame_hz": frame_hz,
             "vap_bin_times": args.vap_bin_times,
             "vap_bin_frames_50hz": bin_frames,
             "label_frame_hz": 50.0,
             "threshold_ratio": args.threshold_ratio,
             "context_seconds": args.context_seconds,
+            "event_weight_alpha": args.event_weight_alpha,
+            "event_weight_unit_pre_s": args.event_weight_unit_pre_s,
+            "event_weight_unit_post_s": args.event_weight_unit_post_s,
+            "event_weight_min_utterance_s": args.event_weight_min_utterance_s,
+            "event_weight_unit_mode": args.event_weight_unit_mode,
+            "event_weight_utterance_merge_gap_s": args.event_weight_utterance_merge_gap_s,
+            "event_weight_utterance_merge_other_max_ratio": args.event_weight_utterance_merge_other_max_ratio,
             "vad_source": args.vad_source,
             "vad_cache_dir": str(args.vad_cache_dir) if args.vad_cache_dir is not None else None,
             "silero_threshold": args.silero_threshold,
@@ -1807,10 +2527,36 @@ def main() -> None:
     if resume_payload is not None and prior_history_path.is_file():
         prior_artifacts = json.loads(prior_history_path.read_text(encoding="utf-8"))
     mid_eval_history: list[dict[str, Any]] = list(prior_artifacts.get("mid_eval_history", []))
+    naturalness_history: list[dict[str, Any]] = list(prior_artifacts.get("naturalness_history", []))
+    naturalness_best_state: dict[str, float | int] = {"value": float("-inf"), "global_step": -1}
+    if args.naturalness_checkpoint_metric != "none":
+        for row in naturalness_history:
+            value = row.get("overall", {}).get(args.naturalness_checkpoint_metric)
+            if value is not None and float(value) > float(naturalness_best_state["value"]):
+                naturalness_best_state = {
+                    "value": float(value),
+                    "global_step": int(row.get("global_step", -1)),
+                }
     eval_loaders = {"dev": val_loader}
     if test1_loader is not None:
         eval_loaders["test1"] = test1_loader
 
+    if naturalness_evaluator is not None and args.naturalness_eval_at_start and resume_payload is None:
+        print("\n[future-VAD] naturalness baseline before training (global_step=0)")
+        baseline = naturalness_evaluator.run(
+            model,
+            device=device,
+            epoch=0,
+            global_step=0,
+            use_autocast=use_amp,
+            autocast_dtype=amp_dtype,
+        )
+        naturalness_history.append(baseline["summary"])
+        print(f"naturalness baseline saved -> {baseline['output_dir']}")
+        if wandb_run is not None:
+            payload = dict(baseline["wandb"])
+            payload.update({"epoch": 0, "global_step": 0})
+            wandb_run.log(payload, step=0)
 
     for epoch in range(start_epoch, int(args.epochs) + 1):
         print(f"\n[future-VAD] epoch {epoch}/{args.epochs}")
@@ -1839,6 +2585,19 @@ def main() -> None:
             eval_loaders=eval_loaders,
             eval_max_batches=args.max_mid_eval_batches,
             eval_history=mid_eval_history,
+            naturalness_evaluator=naturalness_evaluator,
+            naturalness_every_steps=args.naturalness_eval_every_steps,
+            naturalness_history=naturalness_history,
+            naturalness_checkpoint_metric=args.naturalness_checkpoint_metric,
+            naturalness_best_state=naturalness_best_state,
+            checkpoint_dir=ckpt_dir,
+            event_weight_alpha=args.event_weight_alpha,
+            event_weight_unit_pre_s=args.event_weight_unit_pre_s,
+            event_weight_unit_post_s=args.event_weight_unit_post_s,
+            event_weight_min_utterance_s=args.event_weight_min_utterance_s,
+            event_weight_unit_mode=args.event_weight_unit_mode,
+            event_weight_utterance_merge_gap_s=args.event_weight_utterance_merge_gap_s,
+            event_weight_utterance_merge_other_max_ratio=args.event_weight_utterance_merge_other_max_ratio,
         )
         with torch.no_grad():
             val_metrics = run_epoch(
@@ -1861,6 +2620,13 @@ def main() -> None:
                 wandb_prefix="val",
                 wandb_log_every=0,
                 epoch=epoch,
+                event_weight_alpha=args.event_weight_alpha,
+                event_weight_unit_pre_s=args.event_weight_unit_pre_s,
+                event_weight_unit_post_s=args.event_weight_unit_post_s,
+                event_weight_min_utterance_s=args.event_weight_min_utterance_s,
+                event_weight_unit_mode=args.event_weight_unit_mode,
+                event_weight_utterance_merge_gap_s=args.event_weight_utterance_merge_gap_s,
+                event_weight_utterance_merge_other_max_ratio=args.event_weight_utterance_merge_other_max_ratio,
             )
 
         test1_metrics = None
@@ -1882,6 +2648,13 @@ def main() -> None:
                     grad_clip=None,
                     max_batches=args.max_val_batches,
                     desc=f"test1 e{epoch}",
+                    event_weight_alpha=args.event_weight_alpha,
+                    event_weight_unit_pre_s=args.event_weight_unit_pre_s,
+                    event_weight_unit_post_s=args.event_weight_unit_post_s,
+                    event_weight_min_utterance_s=args.event_weight_min_utterance_s,
+                    event_weight_unit_mode=args.event_weight_unit_mode,
+                    event_weight_utterance_merge_gap_s=args.event_weight_utterance_merge_gap_s,
+                    event_weight_utterance_merge_other_max_ratio=args.event_weight_utterance_merge_other_max_ratio,
                 )
 
         row = {"epoch": epoch, "global_step": global_step_state["step"], "train": train_metrics, "val": val_metrics}
@@ -1956,7 +2729,7 @@ def main() -> None:
 
     save_json(
         Path(cfg["paths"]["output_dir"]) / "artifacts" / "history.json",
-        {"history": history, "mid_eval_history": mid_eval_history},
+        {"history": history, "mid_eval_history": mid_eval_history, "naturalness_history": naturalness_history},
     )
     if wandb_run is not None:
         wandb_run.finish()

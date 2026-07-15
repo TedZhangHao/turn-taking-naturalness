@@ -1,0 +1,95 @@
+seed: 42
+
+paths:
+  tar_root: ${OTOSPEECH_ROOT}/data/train
+  extracted_root: ${OTOSPEECH_ROOT}/extracted_train
+  manifest_dir: ${OTOSPEECH_ROOT}/manifests
+  output_dir: ${TURN_TAKE_ROOT}/dualturn/outputs/dualturn_otospeech
+
+precision:
+  mode: bf16
+  matmul_precision: high
+
+logging:
+  use_tensorboard: true
+  tensorboard_subdir: tensorboard
+  flush_secs: 30
+
+data:
+  all_manifest: ${OTOSPEECH_ROOT}/manifests/all_sessions.csv
+  train_manifest: ${OTOSPEECH_ROOT}/manifests/train.csv
+  val_manifest: ${OTOSPEECH_ROOT}/manifests/dev.csv
+  test_manifest: ${OTOSPEECH_ROOT}/manifests/test.csv
+
+  input_mode: tar   # tar | extracted
+  target_sample_rate: 24000
+  channels: 2
+
+  chunk_seconds: 12.0
+  eval_chunk_seconds: 12.0
+
+  samples_per_frame: 1920   # 24kHz * 0.08s
+  frame_hz: 12.5
+
+  vad:
+    rms_threshold: 0.015
+
+  num_workers: 8
+  train_batch_size: 32
+  eval_batch_size: 32
+  pin_memory: true
+
+model:
+  mimi_name: kyutai/mimi
+  qwen_name: Qwen/Qwen2.5-0.5B
+  qwen_dtype: ${precision.mode}
+
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+
+  num_quantizers: 8
+  continuous_feature_dim: 512
+  channel_mlp_hidden: 512
+  channel_proj_dim: 448
+  head_dropout: 0.1
+
+stage1:
+  epochs: 8
+  lr_lora: 3.0e-4
+  lr_full_ft: 1.0e-5
+  weight_decay: 0.01
+  grad_clip: 1.0
+  full_finetune_after_epoch: 10
+  log_every: 20
+
+  # 每个 epoch 验证多少次；2 = 每 1/2 epoch 验一次
+  evals_per_epoch: 1
+
+  # 仍按 epoch 数理解，代码里会自动乘上 evals_per_epoch
+  early_stop_patience: 2
+  scheduler_factor: 0.5
+  scheduler_patience: 2
+
+stage2:
+  epochs: 10
+  lr: 1.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  log_every: 20
+
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+
+  # 每个 epoch 验证多少次；2 = 每 1/2 epoch 验一次
+  evals_per_epoch: 1
+
+  # 仍按 epoch 数理解，代码里会自动乘上 evals_per_epoch
+  early_stop_patience: 2
+  scheduler_factor: 0.5
+  scheduler_patience: 1
+
+probe:
+  max_iter: 1000
+  class_weight: balanced

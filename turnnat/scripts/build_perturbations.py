@@ -5095,7 +5095,7 @@ def generate_shift_hold_insert_time_sweep(
                 "window_ms": int(window_ms),
                 "min_delta_ms": int(lo_delta),
                 "max_delta_ms": int(hi_delta),
-                "generation_note": "insert-time sweep candidate generated without model scores",
+                "generation_note": "insert-time sweep example generated with data-only timing and VAD rules",
             }
             cand_edit_meta = cand_meta.get("edit_meta", {})
             if isinstance(cand_edit_meta, dict):
